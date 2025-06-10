@@ -106,7 +106,7 @@ MINUTES = 60  # seconds
 @app.cls(
     image=image,  # use our container Image
     volumes={OUTPUTS_PATH: outputs, MODEL_PATH: model},  # attach our Volumes
-    gpu="H100",  # use a big, fast GPU
+    gpu="L4",  # use a big, fast GPU
     timeout=10 * MINUTES,  # run inference for up to 10 minutes
     scaledown_window=15 * MINUTES,  # stay idle for 15 minutes before scaling down
 )
@@ -114,11 +114,49 @@ class LTX:
     @modal.enter()
     def load_model(self):
         import torch
-        from diffusers import DiffusionPipeline
-
-        self.pipe = DiffusionPipeline.from_pretrained(
-            "Lightricks/LTX-Video", torch_dtype=torch.bfloat16
+        from diffusers import LTXPipeline, AutoModel
+        from diffusers.hooks import apply_group_offloading
+        
+        # Load transformer with FP8 layerwise weight-casting
+        transformer = AutoModel.from_pretrained(
+            "Lightricks/LTX-Video",
+            subfolder="transformer",
+            torch_dtype=torch.bfloat16
         )
+        transformer.enable_layerwise_casting(
+            storage_dtype=torch.float8_e4m3fn, compute_dtype=torch.bfloat16
+        )
+
+        # Initialize pipeline with optimized transformer
+        self.pipe = LTXPipeline.from_pretrained(
+            "Lightricks/LTX-Video", 
+            transformer=transformer, 
+            torch_dtype=torch.bfloat16
+        )
+
+        # Configure group-offloading for memory optimization
+        onload_device = torch.device("cuda")
+        offload_device = torch.device("cpu")
+        
+        # Apply group offloading to different components
+        self.pipe.transformer.enable_group_offload(
+            onload_device=onload_device, 
+            offload_device=offload_device, 
+            offload_type="leaf_level", 
+            use_stream=True
+        )
+        apply_group_offloading(
+            self.pipe.text_encoder, 
+            onload_device=onload_device, 
+            offload_type="block_level", 
+            num_blocks_per_group=2
+        )
+        apply_group_offloading(
+            self.pipe.vae, 
+            onload_device=onload_device, 
+            offload_type="leaf_level"
+        )
+        
         self.pipe.to("cuda")
 
     @modal.method()
@@ -239,14 +277,10 @@ def main(
 # The remainder of the code in this file is utility code.
 
 DEFAULT_PROMPT = (
-    "The camera pans over a snow-covered mountain range,"
-    " revealing a vast expanse of snow-capped peaks and valleys."
-    " The mountains are covered in a thick layer of snow,"
-    " with some areas appearing almost white while others have a slightly darker, almost grayish hue."
-    " The peaks are jagged and irregular, with some rising sharply into the sky"
-    " while others are more rounded."
-    " The valleys are deep and narrow, with steep slopes that are also covered in snow."
-    " The trees in the foreground are mostly bare, with only a few leaves remaining on their branches."
+    "A woman with long brown hair and light skin smiles at another woman with long blonde hair."
+    "The woman with brown hair wears a black jacket and has a small, barely noticeable mole on her right cheek."
+    "The camera angle is a close-up, focused on the woman with brown hair's face. The lighting is warm and "
+    "natural, likely from the setting sun, casting a soft glow on the scene. The scene appears to be real-life footage"
 )
 
 
