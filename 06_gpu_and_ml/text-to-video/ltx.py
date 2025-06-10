@@ -110,7 +110,7 @@ MINUTES = 60  # seconds
 @app.cls(
     image=image,
     volumes={OUTPUTS_PATH: outputs, MODEL_PATH: model},
-    gpu="L4",
+    gpu="H100",
     timeout=10 * MINUTES,
     scaledown_window=15 * MINUTES,
 )
@@ -121,20 +121,19 @@ class LTX:
         from diffusers import LTXConditionPipeline, LTXLatentUpsamplePipeline, AutoModel
         from diffusers.hooks import apply_group_offloading
 
-        transformer = AutoModel.from_pretrained(
-            "Lightricks/LTX-Video-0.9.7-distilled",
-            subfolder="transformer",
-            torch_dtype=torch.bfloat16
-        )
-        transformer.enable_layerwise_casting(
-            storage_dtype=torch.float8_e4m3fn, compute_dtype=torch.bfloat16
-        )
+        # transformer = AutoModel.from_pretrained(
+        #     "Lightricks/LTX-Video-0.9.7-distilled",
+        #     subfolder="transformer",
+        #     torch_dtype=torch.bfloat16
+        # )
+        # transformer.enable_layerwise_casting(
+        #     storage_dtype=torch.float8_e4m3fn, compute_dtype=torch.bfloat16
+        # )
 
         # Initialize condition pipeline
         self.pipe = LTXConditionPipeline.from_pretrained(
             "Lightricks/LTX-Video-0.9.7-distilled", 
             torch_dtype=torch.bfloat16,
-            transformer=transformer
         )
         
         # Initialize upsampler pipeline
@@ -145,28 +144,28 @@ class LTX:
         )
 
         # Configure group-offloading for memory optimization
-        onload_device = torch.device("cuda")
-        offload_device = torch.device("cpu")
+        # onload_device = torch.device("cuda")
+        # offload_device = torch.device("cpu")
         
         # Apply group offloading to different components
                 # Apply group offloading to different components
-        self.pipe.transformer.enable_group_offload(
-            onload_device=onload_device, 
-            offload_device=offload_device, 
-            offload_type="leaf_level", 
-            use_stream=True
-        )
-        apply_group_offloading(
-            self.pipe.text_encoder, 
-            onload_device=onload_device, 
-            offload_type="block_level", 
-            num_blocks_per_group=2
-        )
-        apply_group_offloading(
-            self.pipe.vae, 
-            onload_device=onload_device, 
-            offload_type="leaf_level"
-        )
+        # self.pipe.transformer.enable_group_offload(
+        #     onload_device=onload_device, 
+        #     offload_device=offload_device, 
+        #     offload_type="leaf_level", 
+        #     use_stream=True
+        # )
+        # apply_group_offloading(
+        #     self.pipe.text_encoder, 
+        #     onload_device=onload_device, 
+        #     offload_type="block_level", 
+        #     num_blocks_per_group=2
+        # )
+        # apply_group_offloading(
+        #     self.pipe.vae, 
+        #     onload_device=onload_device, 
+        #     offload_type="leaf_level"
+        # )
         
         self.pipe.to("cuda")
         self.pipe_upsample.to("cuda")
@@ -244,8 +243,8 @@ class LTX:
         ).frames[0]
 
         # 4. Downscale the video to the expected resolution if needed
-        if upscaled_height != height or upscaled_width != width:
-            video = [frame.resize((width, height)) for frame in video]
+        # if upscaled_height != height or upscaled_width != width:
+        #     video = [frame.resize((width, height)) for frame in video]
 
         # save to disk using prompt as filename
         mp4_name = slugify(prompt)
@@ -296,9 +295,9 @@ class LTX:
 def main(
     prompt: Optional[str] = None,
     negative_prompt="worst quality, blurry, jittery, distorted",
-    num_frames: int = 161,
-    width: int = 704,
-    height: int = 480,
+    num_frames: int = 115,
+    width: int = 1152,
+    height: int = 768,
     guidance_scale: float = 1.0,
     guidance_rescale: float = 0.7,
     decode_timestep: float = 0.05,
@@ -307,18 +306,24 @@ def main(
     downscale_factor: float = 2/3,
     adain_factor: float = 1.0,
     denoise_strength: float = 0.999,
-    twice: bool = True,
+    twice: bool = False,  # Changed default to False since we're doing multiple runs
 ):
-    if prompt is None:
-        prompt = DEFAULT_PROMPT
+    # Define 10 creative prompts
+    prompts = [
+        "A majestic eagle soaring through a sunset-lit canyon, wings spread wide against the orange sky",
+        "A professional chef preparing sushi in a modern kitchen, with precise knife movements and artistic plating",
+        "A street performer doing an acrobatic dance routine in Times Square, surrounded by amazed onlookers",
+        "A young artist painting a vibrant mural on a city wall, with colorful paint splatters and dynamic brushstrokes",
+        "A group of dolphins jumping through ocean waves at sunrise, creating beautiful water splashes",
+    ]
 
     ltx = LTX()
 
-    def run():
-        print(f"🎥 Generating a video from the prompt '{prompt}'")
+    def run(current_prompt):
+        print(f"🎥 Generating a video from the prompt '{current_prompt}'")
         start = time.time()
         mp4_name = ltx.generate.remote(
-            prompt=prompt,
+            prompt=current_prompt,
             negative_prompt=negative_prompt,
             num_frames=num_frames,
             width=width,
@@ -341,12 +346,19 @@ def main(
         local_path = local_dir / mp4_name
         local_path.write_bytes(b"".join(outputs.read_file(mp4_name)))
         print(f"🎥 LTX video saved locally at {local_path}")
+        print("\n" + "="*80 + "\n")  # Add separator between runs
 
-    run()
-
-    if twice:
-        print("🎥 Generating a video from a warm container")
-        run()
+    # If a specific prompt was provided via command line, use only that one
+    if prompt is not None:
+        run(prompt)
+    else:
+        # Run all 10 predefined prompts
+        print("🎬 Starting generation of 10 different videos...")
+        for i, current_prompt in enumerate(prompts, 1):
+            print(f"\n📽 Video {i}/10")
+            run(current_prompt)
+            
+        print("✨ All 10 videos have been generated successfully!")
 
 
 # ## Addenda
