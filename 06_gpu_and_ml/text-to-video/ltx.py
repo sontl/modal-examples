@@ -33,16 +33,20 @@ app = modal.App("example-ltx-video")
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install(
-        "accelerate==1.6.0",
-        "diffusers==0.33.1",
-        "hf_transfer==0.1.9",
-        "imageio==2.37.0",
-        "imageio-ffmpeg==0.5.1",
-        "sentencepiece==0.2.0",
-        "torch==2.7.0",
-        "transformers==4.51.3",
+    .apt_install("git")
+    .run_commands(
+        "pip install git+https://github.com/huggingface/diffusers.git",
     )
+    .pip_install(
+        "accelerate",
+        "hf_transfer",
+        "imageio",
+        "imageio-ffmpeg",
+        "sentencepiece",
+        "torch",
+        "transformers",
+    )
+    
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
 )
 
@@ -104,22 +108,21 @@ MINUTES = 60  # seconds
 
 
 @app.cls(
-    image=image,  # use our container Image
-    volumes={OUTPUTS_PATH: outputs, MODEL_PATH: model},  # attach our Volumes
-    gpu="L4",  # use a big, fast GPU
-    timeout=10 * MINUTES,  # run inference for up to 10 minutes
-    scaledown_window=15 * MINUTES,  # stay idle for 15 minutes before scaling down
+    image=image,
+    volumes={OUTPUTS_PATH: outputs, MODEL_PATH: model},
+    gpu="L4",
+    timeout=10 * MINUTES,
+    scaledown_window=15 * MINUTES,
 )
 class LTX:
     @modal.enter()
     def load_model(self):
         import torch
-        from diffusers import LTXPipeline, AutoModel
+        from diffusers import LTXConditionPipeline, LTXLatentUpsamplePipeline, AutoModel
         from diffusers.hooks import apply_group_offloading
-        
-        # Load transformer with FP8 layerwise weight-casting
+
         transformer = AutoModel.from_pretrained(
-            "Lightricks/LTX-Video",
+            "Lightricks/LTX-Video-0.9.7-distilled",
             subfolder="transformer",
             torch_dtype=torch.bfloat16
         )
@@ -127,10 +130,17 @@ class LTX:
             storage_dtype=torch.float8_e4m3fn, compute_dtype=torch.bfloat16
         )
 
-        # Initialize pipeline with optimized transformer
-        self.pipe = LTXPipeline.from_pretrained(
-            "Lightricks/LTX-Video", 
-            transformer=transformer, 
+        # Initialize condition pipeline
+        self.pipe = LTXConditionPipeline.from_pretrained(
+            "Lightricks/LTX-Video-0.9.7-distilled", 
+            torch_dtype=torch.bfloat16,
+            transformer=transformer
+        )
+        
+        # Initialize upsampler pipeline
+        self.pipe_upsample = LTXLatentUpsamplePipeline.from_pretrained(
+            "Lightricks/ltxv-spatial-upscaler-0.9.7",
+            vae=self.pipe.vae,
             torch_dtype=torch.bfloat16
         )
 
@@ -139,6 +149,7 @@ class LTX:
         offload_device = torch.device("cpu")
         
         # Apply group offloading to different components
+                # Apply group offloading to different components
         self.pipe.transformer.enable_group_offload(
             onload_device=onload_device, 
             offload_device=offload_device, 
@@ -158,33 +169,87 @@ class LTX:
         )
         
         self.pipe.to("cuda")
+        self.pipe_upsample.to("cuda")
+        self.pipe.vae.enable_tiling()
+
+    def round_to_nearest_resolution_acceptable_by_vae(self, height, width):
+        height = height - (height % self.pipe.vae_temporal_compression_ratio)
+        width = width - (width % self.pipe.vae_temporal_compression_ratio)
+        return height, width
 
     @modal.method()
     def generate(
         self,
         prompt,
-        negative_prompt="",
-        num_inference_steps=200,
-        guidance_scale=4.5,
-        num_frames=19,
-        width=704,
-        height=480,
+        negative_prompt="worst quality, inconsistent motion, blurry, jittery, distorted",
+        num_frames=161,
+        width=1152,
+        height=768,
+        guidance_scale=1.0,
+        guidance_rescale=0.7,
+        decode_timestep=0.05,
+        decode_noise_scale=0.025,
+        image_cond_noise_scale=0.0,
+        downscale_factor=2/3,
+        adain_factor=1.0,
+        denoise_strength=0.999,
     ):
         from diffusers.utils import export_to_video
-
-        frames = self.pipe(
+        import torch
+        # 1. Generate video at smaller resolution
+        downscaled_height, downscaled_width = int(height * downscale_factor), int(width * downscale_factor)
+        downscaled_height, downscaled_width = self.round_to_nearest_resolution_acceptable_by_vae(downscaled_height, downscaled_width)
+        
+        latents = self.pipe(
             prompt=prompt,
             negative_prompt=negative_prompt,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
+            width=downscaled_width,
+            height=downscaled_height,
             num_frames=num_frames,
-            width=width,
-            height=height,
+            timesteps=[1000, 993, 987, 981, 975, 909, 725, 0.03],
+            decode_timestep=decode_timestep,
+            decode_noise_scale=decode_noise_scale,
+            image_cond_noise_scale=image_cond_noise_scale,
+            guidance_scale=guidance_scale,
+            guidance_rescale=guidance_rescale,
+            generator=torch.Generator().manual_seed(0),
+            output_type="latent",
+        ).frames
+
+        # 2. Upscale generated video using latent upsampler
+        upscaled_height, upscaled_width = downscaled_height * 2, downscaled_width * 2
+        upscaled_latents = self.pipe_upsample(
+            latents=latents,
+            adain_factor=adain_factor,
+            output_type="latent"
+        ).frames
+
+        # 3. Denoise the upscaled video with few steps to improve texture
+        video = self.pipe(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            width=upscaled_width,
+            height=upscaled_height,
+            num_frames=num_frames,
+            denoise_strength=denoise_strength,
+            timesteps=[1000, 909, 725, 421, 0],
+            latents=upscaled_latents,
+            decode_timestep=decode_timestep,
+            decode_noise_scale=decode_noise_scale,
+            image_cond_noise_scale=image_cond_noise_scale,
+            guidance_scale=guidance_scale,
+            guidance_rescale=guidance_rescale,
+            generator=torch.Generator().manual_seed(0),
+            output_type="pil",
         ).frames[0]
+
+        # 4. Downscale the video to the expected resolution if needed
+        if upscaled_height != height or upscaled_width != width:
+            video = [frame.resize((width, height)) for frame in video]
 
         # save to disk using prompt as filename
         mp4_name = slugify(prompt)
-        export_to_video(frames, Path(OUTPUTS_PATH) / mp4_name)
+        export_to_video(video, Path(OUTPUTS_PATH) / mp4_name, fps=24)
         outputs.commit()
         return mp4_name
 
@@ -231,12 +296,18 @@ class LTX:
 def main(
     prompt: Optional[str] = None,
     negative_prompt="worst quality, blurry, jittery, distorted",
-    num_inference_steps: int = 10,  # 10 when testing, 100 or more when generating
-    guidance_scale: float = 2.5,
-    num_frames: int = 150,  # produces ~10s of video
+    num_frames: int = 161,
     width: int = 704,
     height: int = 480,
-    twice: bool = True,  # run twice to show cold start latency
+    guidance_scale: float = 1.0,
+    guidance_rescale: float = 0.7,
+    decode_timestep: float = 0.05,
+    decode_noise_scale: float = 0.025,
+    image_cond_noise_scale: float = 0.0,
+    downscale_factor: float = 2/3,
+    adain_factor: float = 1.0,
+    denoise_strength: float = 0.999,
+    twice: bool = True,
 ):
     if prompt is None:
         prompt = DEFAULT_PROMPT
@@ -249,11 +320,17 @@ def main(
         mp4_name = ltx.generate.remote(
             prompt=prompt,
             negative_prompt=negative_prompt,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
             num_frames=num_frames,
             width=width,
             height=height,
+            guidance_scale=guidance_scale,
+            guidance_rescale=guidance_rescale,
+            decode_timestep=decode_timestep,
+            decode_noise_scale=decode_noise_scale,
+            image_cond_noise_scale=image_cond_noise_scale,
+            downscale_factor=downscale_factor,
+            adain_factor=adain_factor,
+            denoise_strength=denoise_strength,
         )
         duration = time.time() - start
         print(f"🎥 Client received video in {int(duration)}s")
@@ -277,10 +354,14 @@ def main(
 # The remainder of the code in this file is utility code.
 
 DEFAULT_PROMPT = (
-    "A woman with long brown hair and light skin smiles at another woman with long blonde hair."
-    "The woman with brown hair wears a black jacket and has a small, barely noticeable mole on her right cheek."
-    "The camera angle is a close-up, focused on the woman with brown hair's face. The lighting is warm and "
-    "natural, likely from the setting sun, casting a soft glow on the scene. The scene appears to be real-life footage"
+    "A woman with short brown hair, wearing a maroon sleeveless top and a silver necklace, "
+    "walks through a room while talking, then a woman with pink hair and a white shirt "
+    "appears in the doorway and yells. The first woman walks from left to right, her "
+    "expression serious; she has light skin and her eyebrows are slightly furrowed. The "
+    "second woman stands in the doorway, her mouth open in a yell; she has light skin and "
+    "her eyes are wide. The room is dimly lit, with a bookshelf visible in the background. "
+    "The camera follows the first woman as she walks, then cuts to a close-up of the second "
+    "woman's face. The scene is captured in real-life footage."
 )
 
 
