@@ -6,6 +6,7 @@ import tempfile
 import numpy as np
 from PIL import Image
 import io
+from urllib.parse import urlparse
 
 # Define the Modal app
 app = modal.App("hunyuan-video-avatar")
@@ -100,6 +101,7 @@ def setup_models():
     
     # Create models directory if it doesn't exist
     os.makedirs("/models", exist_ok=True)
+    os.makedirs("./weights/ckpts/hunyuan-video-t2v-720p/transformers", exist_ok=True)
     
     # Download models (adjust based on actual model requirements)
     try:
@@ -107,14 +109,7 @@ def setup_models():
         subprocess.run([
             "python", "-c", 
             "from huggingface_hub import snapshot_download; "
-            "snapshot_download('tencent/HunyuanVideo-Avatar', local_dir='/models/hunyuan-avatar')"
-        ], check=True)
-        
-        # Also download base HunyuanVideo model if needed
-        subprocess.run([
-            "python", "-c", 
-            "from huggingface_hub import snapshot_download; "
-            "snapshot_download('tencent/HunyuanVideo', local_dir='/models/hunyuan-video')"
+            "snapshot_download('tencent/HunyuanVideo-Avatar', local_dir='./weights')"
         ], check=True)
         
         print("Models downloaded successfully!")
@@ -151,49 +146,92 @@ def generate_avatar_video(
     
     os.chdir("/app")
     
+    # Set environment variables
+    os.environ["PYTHONPATH"] = "./"
+    os.environ["MODEL_BASE"] = "./weights"
+    os.environ["DISABLE_SP"] = "1"  # For single-GPU mode
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Use the first GPU
+    
+    # Create assets directory if it doesn't exist
+    os.makedirs("assets", exist_ok=True)
+    
+    # Create test.csv in the assets directory
+    test_csv_path = os.path.join("assets", "test.csv")
+    
     # Create temporary directory for this job
     with tempfile.TemporaryDirectory() as temp_dir:
-        # Download input image
-        img_response = requests.get(input_image_url)
+        # Handle input image - could be URL or local path
         input_image_path = os.path.join(temp_dir, "input_image.jpg")
-        with open(input_image_path, "wb") as f:
-            f.write(img_response.content)
         
-        # Download audio if provided
+        # Check if input_image_url is a URL or local path
+        parsed_url = urlparse(input_image_url)
+        if parsed_url.scheme in ('http', 'https'):
+            # It's a URL, download it
+            img_response = requests.get(input_image_url)
+            with open(input_image_path, "wb") as f:
+                f.write(img_response.content)
+        else:
+            # It's a local path, just use it directly
+            input_image_path = input_image_url
+        
+        # Handle audio if provided - similar logic for URL vs local path
         audio_path = None
         if audio_url:
-            audio_response = requests.get(audio_url)
-            audio_path = os.path.join(temp_dir, "input_audio.wav")
-            with open(audio_path, "wb") as f:
-                f.write(audio_response.content)
+            parsed_audio_url = urlparse(audio_url)
+            if parsed_audio_url.scheme in ('http', 'https'):
+                # It's a URL, download it
+                audio_response = requests.get(audio_url)
+                audio_path = os.path.join(temp_dir, "input_audio.wav")
+                with open(audio_path, "wb") as f:
+                    f.write(audio_response.content)
+            else:
+                # It's a local path, use it directly
+                audio_path = audio_url
+        
+        # Write to test.csv in the assets directory
+        with open(test_csv_path, "w") as f:
+            f.write("image_path,audio_path,prompt\n")
+            f.write(f"{input_image_path},{audio_path if audio_path else ''},\"{prompt}\"\n")
         
         # Prepare output path
-        output_path = os.path.join(temp_dir, "output_video.mp4")
+        output_path = os.path.join(temp_dir, "output")
+        os.makedirs(output_path, exist_ok=True)
+        
+        # Define checkpoint path
+        checkpoint_path = "./weights/ckpts/hunyuan-video-t2v-720p/transformers/mp_rank_00_model_states_fp8.pt"
         
         # Build command for HunyuanVideo-Avatar
         cmd = [
-            "python", "inference.py",
-            "--image_path", input_image_path,
-            "--prompt", prompt,
-            "--output_path", output_path,
-            "--num_frames", str(num_frames),
-            "--height", str(height),
-            "--width", str(width),
-            "--fps", str(fps)
+            "python3",
+            "hymm_sp/sample_gpu_poor.py",
+            "--input", test_csv_path,
+            "--ckpt", checkpoint_path,
+            "--sample-n-frames", str(num_frames),
+            "--seed", "128",
+            "--image-size", str(width),  # Using width as image size
+            "--cfg-scale", "7.5",
+            "--infer-steps", "50",
+            "--use-deepcache", "1",
+            "--flow-shift-eval-video", "5.0",
+            "--save-path", output_path,
+            "--use-fp8",
+            "--infer-min"
         ]
-        
-        # Add audio if provided
-        if audio_path:
-            cmd.extend(["--audio_path", audio_path])
         
         try:
             # Run the inference
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             print("Inference output:", result.stdout)
             
-            # Read the output video
-            if os.path.exists(output_path):
-                with open(output_path, "rb") as f:
+            # Find the output video file
+            output_video = None
+            for file in os.listdir(output_path):
+                if file.endswith(".mp4"):
+                    output_video = os.path.join(output_path, file)
+                    break
+            
+            if output_video and os.path.exists(output_video):
+                with open(output_video, "rb") as f:
                     video_data = f.read()
                 return {
                     "success": True,
@@ -319,7 +357,7 @@ def web_interface():
         title="HunyuanVideo-Avatar Generator",
         description="Generate talking avatar videos from a face image and audio/prompt",
         theme="soft",
-        allow_flagging="never",
+        flagging_mode="never"
     )
     
     # Mount the Gradio app on FastAPI
