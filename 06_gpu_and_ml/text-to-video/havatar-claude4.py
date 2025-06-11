@@ -8,8 +8,14 @@ from PIL import Image
 import io
 from urllib.parse import urlparse
 
-# Define the Modal app
+# Define the Modal app first
 app = modal.App("hunyuan-video-avatar")
+
+# Define constants
+MODEL_PATH = "/models"  # where the Volume will appear on our Functions' filesystems
+
+# Define the volume
+model_volume = modal.Volume.from_name("hunyuan-models", create_if_missing=True)
 
 # Create a custom image with all dependencies
 image = (
@@ -70,10 +76,12 @@ image = (
         "git clone https://github.com/Tencent-Hunyuan/HunyuanVideo-Avatar.git /app",
         "cd /app && pip install -r requirements.txt || echo 'No requirements.txt found or installation failed, continuing...'"
     ])
+    # Update the image to set the environment variables for model caching
+    .env({
+        "HF_HUB_ENABLE_HF_TRANSFER": "1",  # faster downloads
+        "HF_HUB_CACHE": MODEL_PATH,
+    })
 )
-
-# Mount for persistent storage of models
-volume = modal.Volume.from_name("hunyuan-models", create_if_missing=True)
 
 # Create a web image specifically for the Gradio interface
 web_image = modal.Image.debian_slim(python_version="3.10").pip_install(
@@ -87,10 +95,10 @@ web_image = modal.Image.debian_slim(python_version="3.10").pip_install(
 
 @app.function(
     image=image,
-    gpu="A100-80GB",  # Use string format for GPU specification
-    volumes={"/models": volume},
-    timeout=3600,  # 1 hour timeout
-    memory=64*1024,  # 64GB RAM
+    gpu="A100-80GB",
+    volumes={MODEL_PATH: model_volume},
+    timeout=3600,
+    memory=64*1024,
 )
 def setup_models():
     """Download and setup required models"""
@@ -100,12 +108,11 @@ def setup_models():
     os.chdir("/app")
     
     # Create models directory if it doesn't exist
-    os.makedirs("/models", exist_ok=True)
+    os.makedirs(MODEL_PATH, exist_ok=True)
     os.makedirs("./weights/ckpts/hunyuan-video-t2v-720p/transformers", exist_ok=True)
     
-    # Download models (adjust based on actual model requirements)
+    # Download models
     try:
-        # Download HunyuanVideo-Avatar models from Hugging Face
         subprocess.run([
             "python", "-c", 
             "from huggingface_hub import snapshot_download; "
@@ -117,7 +124,6 @@ def setup_models():
     except subprocess.CalledProcessError as e:
         print(f"Error downloading models: {e}")
         print("You may need to manually download the models or check authentication")
-        # Continue without failing
         pass
     
     return "Setup complete"
@@ -125,7 +131,7 @@ def setup_models():
 @app.function(
     image=image,
     gpu="A100-80GB",
-    volumes={"/models": volume},
+    volumes={MODEL_PATH: model_volume},
     timeout=1800,  # 30 minutes
     memory=64*1024,  # 64GB RAM
 )
@@ -363,6 +369,10 @@ def web_interface():
     # Mount the Gradio app on FastAPI
     app = FastAPI()
     return mount_gradio_app(app=app, blocks=interface, path="/")
+
+@app.function(schedule=modal.Period(days=1))  # Optional: Run daily to check/update models
+def init_models():
+    return setup_models.remote()
 
 @app.local_entrypoint()
 def main():
