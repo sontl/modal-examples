@@ -3,6 +3,9 @@ import os
 import subprocess
 from pathlib import Path
 import tempfile
+import numpy as np
+from PIL import Image
+import io
 
 # Define the Modal app
 app = modal.App("hunyuan-video-avatar")
@@ -49,7 +52,6 @@ image = (
         "safetensors",
         "huggingface-hub",
         "datasets",
-        "gradio",
         "imageio",
         "imageio-ffmpeg",
         "decord",
@@ -71,6 +73,16 @@ image = (
 
 # Mount for persistent storage of models
 volume = modal.Volume.from_name("hunyuan-models", create_if_missing=True)
+
+# Create a web image specifically for the Gradio interface
+web_image = modal.Image.debian_slim(python_version="3.10").pip_install(
+    "fastapi[standard]==0.115.4",
+    "gradio~=5.7.1",
+    "pillow~=10.2.0",
+    "pydantic==2.10.6",
+    "soundfile~=0.12.1",
+    "numpy~=1.24.3"
+)
 
 @app.function(
     image=image,
@@ -205,25 +217,64 @@ def generate_avatar_video(
             }
 
 @app.function(
-    image=image,
-    volumes={"/models": volume}
+    image=web_image,  # Use the web image instead of the main image
+    min_containers=1,
+    scaledown_window=60 * 20,
+    # gradio requires sticky sessions
+    # so we limit the number of concurrent containers to 1
+    # and allow it to scale to 100 concurrent inputs
+    max_containers=1,
 )
-def create_gradio_interface():
-    """Create a Gradio web interface for the avatar generation"""
+@modal.concurrent(max_inputs=100)
+@modal.asgi_app()
+def web_interface():
+    """Web endpoint to serve the Gradio interface"""
     import gradio as gr
-    import requests
-    import base64
-    import io
+    from fastapi import FastAPI
+    from gradio.routes import mount_gradio_app
     
     def generate_video_interface(input_image, audio_file, prompt, num_frames, height, width, fps):
         try:
-            # Convert image to URL (you'd need to upload to a temporary service or encode)
-            # For simplicity, this is a placeholder - you'd need to handle file uploads properly
+            # Convert image to temporary file
+            if input_image is not None:
+                import tempfile
+                import os
+                from PIL import Image
+                import io
+                
+                # Save image to temporary file
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp:
+                    if isinstance(input_image, str):
+                        # If it's already a file path
+                        input_image_path = input_image
+                    else:
+                        # If it's PIL Image or numpy array
+                        if isinstance(input_image, np.ndarray):
+                            input_image = Image.fromarray(input_image)
+                        input_image.save(tmp.name)
+                        input_image_path = tmp.name
+
+            # Handle audio file
+            audio_path = None
+            if audio_file is not None:
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp:
+                    if isinstance(audio_file, tuple):
+                        # If it's a tuple (sampling_rate, audio_data)
+                        import soundfile as sf
+                        sampling_rate, audio_data = audio_file
+                        sf.write(tmp.name, audio_data, sampling_rate)
+                        audio_path = tmp.name
+                    elif hasattr(audio_file, 'name'):
+                        # If it's a file object
+                        audio_path = audio_file.name
+                    else:
+                        # If it's a path string
+                        audio_path = audio_file
             
             # Call the generation function
             result = generate_avatar_video.remote(
-                input_image_url="placeholder",  # You'd need to handle this properly
-                audio_url=None if not audio_file else "placeholder",
+                input_image_url=input_image_path,
+                audio_url=audio_path,
                 prompt=prompt,
                 num_frames=int(num_frames),
                 height=int(height),
@@ -231,36 +282,49 @@ def create_gradio_interface():
                 fps=int(fps)
             )
             
+            # Clean up temporary files
+            if input_image is not None and os.path.exists(input_image_path):
+                os.unlink(input_image_path)
+            if audio_path and os.path.exists(audio_path):
+                os.unlink(audio_path)
+            
             if result["success"]:
-                # Return the video
-                return result["video_data"], "Success!"
+                # Convert video data to file-like object
+                video_bytes = io.BytesIO(result["video_data"])
+                return video_bytes, "Success!"
             else:
                 return None, f"Error: {result['error']}"
                 
         except Exception as e:
-            return None, f"Error: {str(e)}"
+            import traceback
+            error_msg = f"Error: {str(e)}\n{traceback.format_exc()}"
+            return None, error_msg
     
     # Create Gradio interface
     interface = gr.Interface(
         fn=generate_video_interface,
         inputs=[
-            gr.Image(type="filepath", label="Input Face Image"),
-            gr.Audio(type="filepath", label="Audio (optional)"),
+            gr.Image(label="Input Face Image"),
+            gr.Audio(label="Audio (optional)"),
             gr.Textbox(value="A person speaking naturally", label="Prompt"),
-            gr.Slider(minimum=24, maximum=240, value=120, step=8, label="Number of Frames"),
-            gr.Slider(minimum=256, maximum=1024, value=512, step=64, label="Height"),
-            gr.Slider(minimum=256, maximum=1024, value=512, step=64, label="Width"),
-            gr.Slider(minimum=12, maximum=30, value=24, step=1, label="FPS")
+            gr.Number(value=120, label="Number of Frames"),
+            gr.Number(value=512, label="Height"),
+            gr.Number(value=512, label="Width"),
+            gr.Number(value=24, label="FPS")
         ],
         outputs=[
             gr.Video(label="Generated Avatar Video"),
             gr.Textbox(label="Status")
         ],
         title="HunyuanVideo-Avatar Generator",
-        description="Generate talking avatar videos from a face image and audio/prompt"
+        description="Generate talking avatar videos from a face image and audio/prompt",
+        theme="soft",
+        allow_flagging="never",
     )
     
-    return interface
+    # Mount the Gradio app on FastAPI
+    app = FastAPI()
+    return mount_gradio_app(app=app, blocks=interface, path="/")
 
 @app.local_entrypoint()
 def main():
@@ -274,18 +338,6 @@ def main():
     
     print("HunyuanVideo-Avatar is ready!")
     print("You can now call the generate_avatar_video function with your inputs.")
-
-# Web interface endpoint
-@app.function(
-    image=image,
-    volumes={"/models": volume}
-)
-@modal.concurrent(max_inputs=10)
-@modal.fastapi_endpoint(method="GET")
-def web_interface():
-    """Web endpoint to serve the Gradio interface"""
-    interface = create_gradio_interface()
-    return interface.launch(server_name="0.0.0.0", server_port=8000, share=False)
 
 if __name__ == "__main__":
     # For local testing
