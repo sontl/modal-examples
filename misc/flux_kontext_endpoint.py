@@ -57,7 +57,6 @@ flux_kontext_endpoint_image = (
     .run_commands(
         "pip install git+https://github.com/huggingface/diffusers.git",
         "pip install git+https://github.com/black-forest-labs/flux.git",
-        "pip install pruna"
     )
     .pip_install(
         "accelerate==1.6.0",
@@ -71,6 +70,7 @@ flux_kontext_endpoint_image = (
         "safetensors==0.5.3",
         "sentencepiece==0.2.0",
         "torch==2.7.0",
+        "triton",
         "transformers==4.51.3",
     )
     .env({
@@ -80,6 +80,7 @@ flux_kontext_endpoint_image = (
         "HF_HUB_CACHE": str(CONTAINER_CACHE_DIR / ".hf_hub_cache"),
         "TORCHINDUCTOR_CACHE_DIR": str(CONTAINER_CACHE_DIR / ".inductor_cache"),
         "TRITON_CACHE_DIR": str(CONTAINER_CACHE_DIR / ".triton_cache"),
+        "TORCH_COMPILE_DEBUG": "1",  # Enable debug info for torch.compile
     })
 )
 
@@ -203,6 +204,8 @@ class FluxService:
         # monkey-patch torch inductor remove_noop_ops pass for para-attn dynamic compilation
         # swallow AttributeError: 'SymFloat' object has no attribute 'size' and return false
         from torch._inductor.fx_passes import post_grad
+        import torch
+        from diffusers.utils import load_image
 
         if not hasattr(post_grad, "_orig_same_meta"):
             post_grad._orig_same_meta = post_grad.same_meta
@@ -218,12 +221,16 @@ class FluxService:
 
             post_grad.same_meta = _safe_same_meta
 
+        # Load a real image for compilation
+        image_url = "https://i.ibb.co/TB3vGhfb/test-image.png"
+        real_image = load_image(str(image_url))
+        
         print("triggering torch compile")
-        self.pipe("dummy prompt", height=1024, width=1024, num_images_per_prompt=1)
+        self.pipe(prompt="the girl is dancing", image=real_image, height=1024, width=1024, num_images_per_prompt=1)
 
         # comment this out if you only need num_images_per_prompt=1
-        print("recompiling for dynamic batch size")
-        self.pipe("dummy prompt", height=1024, width=1024, num_images_per_prompt=2)
+        # print("recompiling for dynamic batch size")
+        # self.pipe(prompt="dummy prompt", image=real_image, height=1024, width=1024, num_images_per_prompt=2)
 
     # ## Mega-cache management
 
@@ -276,6 +283,7 @@ class FluxService:
 
         # Initialize Pruna SmashConfig for ultra-juiced optimization
         # self.smash_config = SmashConfig()
+        
         # self.smash_config["quantizer"] = "fp8"
         # self.smash_config["compiler"] = "torch_compile"
         # self.smash_config["torch_compile_target"] = "module_list"
@@ -283,7 +291,14 @@ class FluxService:
         # self.smash_config["objective"] = "quality"
         # self.smash_config["auto_cache_mode"] = "bdf"
         # self.smash_config["auto_speed_factor"] = 0.4
-
+        
+        # Use diffusers_int8 quantization which is compatible with diffusion models
+        #self.smash_config["quantizer"] = "hqq_diffusers"
+        #self.smash_config['hqq_diffusers_weight_bits'] = 8
+        # Use torch_compile for compilation optimization
+        # self.smash_config["compiler"] = "torch_compile"
+        # self.smash_config["torch_compile_target"] = "module_list"
+        # self.smash_config["cacher"] = "pab"
         # Set up mega cache paths
         mega_cache_dir = CONTAINER_CACHE_DIR / ".mega_cache"
         mega_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -293,22 +308,25 @@ class FluxService:
     def setup(self):
         # Install flux package for integrity checker
         # from flux.content_filters import PixtralContentFilter
-        # from pruna import smash, SmashConfig
+        #from pruna import smash, SmashConfig
         # self.integrity_checker = PixtralContentFilter("cuda")
-        
-        self.pipe.to("cuda")
 
         # Apply Pruna optimizations
-        print("Applying Pruna optimizations...")
+        # print("Applying Pruna optimizations...")
+
         # self.pipe = smash(
         #     model=self.pipe,
         #     smash_config=self.smash_config,
         # )
 
+        # print("Pruna optimizations applied")
+        
+        self.pipe.to("cuda")
 
         self._load_mega_cache()
-        # self._optimize()
-        # self._compile()
+        self._optimize()
+        self._compile()
+
         self._save_mega_cache()
 
         # Initialize S3 client for R2 storage
@@ -349,6 +367,8 @@ class FluxService:
             image=input_image,
             prompt=request.prompt,
             negative_prompt=request.negative_prompt,
+            height=request.height,
+            width=request.width,
             guidance_scale=request.guidance_scale,
             num_images_per_prompt=request.num_images,
             generator=generator,
