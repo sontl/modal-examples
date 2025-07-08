@@ -157,7 +157,7 @@ with flux_kontext_nunchanku_endpoint_image.imports():
     },
     min_containers=0,
     buffer_containers=0,
-    scaledown_window=30,  # 5 minutes
+    scaledown_window=2,  # 1 seconds
     timeout=3600,  # 1 hour
     enable_memory_snapshot=True,
 )
@@ -168,8 +168,14 @@ class FluxKontextnunchankuService:
     # The main optimizations are first block cache and torch compile.
 
     def _optimize(self):
+         # apply first block cache, see: [ParaAttention](https://github.com/chengzeyi/ParaAttention)
+        # apply_cache_on_pipe(
+        #     self.pipe,
+        #     residual_diff_threshold=0.12,  # don't recommend going higher
+        # )
         # Nunchaku handles most optimizations for the transformer
         # We only apply optimizations to the VAE
+        self.pipe.transformer.to(memory_format=torch.channels_last)
         self.pipe.vae.fuse_qkv_projections()
         self.pipe.vae.to(memory_format=torch.channels_last)
 
@@ -221,14 +227,12 @@ class FluxKontextnunchankuService:
 
     @modal.enter(snap=True)
     def load(self):
-        print("Loading Nunchaku optimized transformer...")
-        # Load model without GPU precision check during snapshot
-        precision = "int4"
-        transformer = NunchakuFluxTransformer2dModel.from_pretrained(
-            f"mit-han-lab/nunchaku-flux.1-kontext-dev/svdq-{precision}_r32-flux.1-kontext-dev.safetensors"
-        )
+        print("Loading base pipeline...")
+        # Load base pipeline without transformer during snapshot
         self.pipe = FluxKontextPipeline.from_pretrained(
-            "black-forest-labs/FLUX.1-Kontext-dev", transformer=transformer, torch_dtype=torch.bfloat16
+            "black-forest-labs/FLUX.1-Kontext-dev",
+            transformer=None,  # We'll load the transformer in setup
+            torch_dtype=torch.bfloat16
         ).to("cpu")
 
         # Initialize mega cache paths
@@ -238,17 +242,21 @@ class FluxKontextnunchankuService:
 
     @modal.enter(snap=False)
     def setup(self):
-        # Now GPU is available, we can initialize Nunchaku transformer
         print("Initializing Nunchaku transformer...")
+        # Initialize Nunchaku transformer now that GPU is available
+        precision = "int4"
+        transformer = NunchakuFluxTransformer2dModel.from_pretrained(
+            f"mit-han-lab/nunchaku-flux.1-kontext-dev/svdq-{precision}_r32-flux.1-kontext-dev.safetensors"
+        )
+        transformer.set_attention_impl("nunchaku-fp16")
         
+        # Set the transformer in the pipeline
+        self.pipe.transformer = transformer
         self.pipe.to("cuda")
-        self._load_mega_cache()
         
-        # Nunchaku already includes optimizations, so we skip some of the previous ones
-        # but keep the memory format optimization
-        self.pipe.transformer.to(memory_format=torch.channels_last)
-        self.pipe.vae.to(memory_format=torch.channels_last)
-
+        self._load_mega_cache()
+        self._optimize()
+        # self._compile()
         self._save_mega_cache()
 
     # ## The main inference endpoint
