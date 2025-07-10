@@ -13,9 +13,29 @@ import modal
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
+    .apt_install("libgl1")
+    .apt_install("libglib2.0-0")
     .pip_install("fastapi[standard]==0.115.4")
     .pip_install("comfy-cli==1.4.1")
     .run_commands("comfy --skip-prompt install --fast-deps --nvidia")
+    .run_commands(  # download the ComfyUI Essentials custom node pack
+        "comfy node registry-install comfyui-kjnodes"
+    )
+    .run_commands(  # download the ComfyUI Essentials custom node pack
+        "comfy node registry-install ComfyUI-GGUF"
+    )
+    .run_commands(  # download the ComfyUI Essentials custom node pack
+        "comfy node registry-install rgthree-comfy"
+    )
+    .run_commands(  # download the ComfyUI Essentials custom node pack
+        "comfy node registry-install comfyui-videohelpersuite"
+    )
+    .run_commands(  # download the ComfyUI Essentials custom node pack
+        "comfy node registry-install comfyui-logicutils"
+    )
+    .run_commands(  # download the ComfyUI Essentials custom node pack
+        "comfy node registry-install comfyui-multigpu"
+    )
 )
 
 # Add custom node that patches core ComfyUI so that we can use Modal's [memory snapshot](https://modal.com/docs/guide/memory-snapshot)
@@ -96,18 +116,22 @@ image = (
     )
 )
 
+# Lastly, copy the ComfyUI workflow JSON to the container.
+image = image.add_local_file(
+    Path(__file__).parent / "wan_workflow_api.json", "/root/workflow_api.json"
+)
 
 app = modal.App(name="wan21-fusion-x", image=image)
 
 
 @app.cls(
     max_containers=1,
-    gpu="L40S",
+    gpu="T4",
     volumes={"/cache": vol},
     enable_memory_snapshot=True,  # snapshot container state for faster cold starts
 )
 @modal.concurrent(max_inputs=10)
-class ComfyUIMemorySnapshot:
+class WanFusionX:
     port: int = 8000
 
     # Snapshot ComfyUI server launch state, which includes import torch and custom node initialization (GPU not available during this step)
