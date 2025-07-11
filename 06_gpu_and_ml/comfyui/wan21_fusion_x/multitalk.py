@@ -87,16 +87,18 @@ def hf_download():
     )
     
     # Download the text encoder model
-    text_encoder_model = hf_hub_download(
-        repo_id="Comfy-Org/Wan_2.1_ComfyUI_repackaged",
-        filename="split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+    wan_text_encoder_model = hf_hub_download(
+        repo_id="city96/umt5-xxl-encoder-gguf",
+        filename="umt5-xxl-encoder-Q8_0.gguf",
         cache_dir="/cache",
     )
+
     subprocess.run(
-        f"ln -s {text_encoder_model} /root/comfy/ComfyUI/models/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+        f"ln -s {wan_text_encoder_model} /root/comfy/ComfyUI/models/text_encoders/umt5-xxl-encoder-Q8_0.gguf",
         shell=True,
         check=True,
     )
+    
 
     # (Optional) Download the FusionX GGUF model (currently commented out)
     # Uncomment if you want to use the FusionX GGUF model
