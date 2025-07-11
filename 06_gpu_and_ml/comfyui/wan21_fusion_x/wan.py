@@ -17,6 +17,7 @@ image = (
     .apt_install("libglib2.0-0")
     .pip_install("fastapi[standard]==0.115.4")
     .pip_install("comfy-cli==1.4.1")
+    .pip_install("sageattention")
     .run_commands("comfy --skip-prompt install --fast-deps --nvidia")
     .run_commands(  # download the ComfyUI Essentials custom node pack
         "comfy node registry-install comfyui-kjnodes"
@@ -35,6 +36,11 @@ image = (
     )
     .run_commands(  # download the ComfyUI Essentials custom node pack
         "comfy node registry-install comfyui-multigpu"
+    )
+    .run_commands(
+        "comfy --skip-prompt model download --url  https://huggingface.co/vrgamedevgirl84/Wan14BT2VFusioniX/resolve/main/OtherLoRa%27s/Wan14B_RealismBoost.safetensors?download=true --relative-path models/loras",
+    ).run_commands(
+        "comfy --skip-prompt model download --url  https://huggingface.co/vrgamedevgirl84/Wan14BT2VFusioniX/resolve/main/OtherLoRa%27s/DetailEnhancerV1.safetensors?download=true --relative-path models/loras",
     )
 )
 
@@ -81,13 +87,13 @@ def hf_download():
     )
 
     wan_text_encoder_model = hf_hub_download(
-        repo_id="city96/umt5-xxl-encoder-gguf",
-        filename="umt5-xxl-encoder-Q8_0.gguf",
+        repo_id="Comfy-Org/Wan_2.1_ComfyUI_repackaged",
+        filename="split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
         cache_dir="/cache",
-    )
+    ) 
 
     subprocess.run(
-        f"ln -s {wan_text_encoder_model} /root/comfy/ComfyUI/models/text_encoders/umt5-xxl-encoder-Q8_0.gguf",
+        f"ln -s {wan_text_encoder_model} /root/comfy/ComfyUI/models/text_encoders/native_umt5_xxl_fp8_e4m3fn_scaled.safetensors",
         shell=True,
         check=True,
     )
@@ -104,7 +110,56 @@ def hf_download():
         check=True,
     )
     
+    # download LoRA models
+    os.makedirs("/root/comfy/ComfyUI/models/loras", exist_ok=True)
+    lora_model = hf_hub_download(
+        repo_id="Kijai/WanVideo_comfy",
+        filename="Wan21_CausVid_14B_T2V_lora_rank32_v2.safetensors",
+        cache_dir="/cache",
+    )
+
+    subprocess.run(
+        f"ln -s {lora_model} /root/comfy/ComfyUI/models/loras/Wan21_CausVid_14B_T2V_lora_rank32_v2.safetensors",
+        shell=True,
+        check=True,
+    )
+
+    lora_model = hf_hub_download(
+        repo_id="Kijai/WanVideo_comfy",
+        filename="Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank32.safetensors",
+        cache_dir="/cache",
+    )
+
+    subprocess.run(
+        f"ln -s {lora_model} /root/comfy/ComfyUI/models/loras/Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank32.safetensors",
+        shell=True,
+        check=True,
+    )
+
+    lora_model = hf_hub_download(
+        repo_id="alibaba-pai/Wan2.1-Fun-Reward-LoRAs",
+        filename="Wan2.1-Fun-14B-InP-MPS.safetensors",
+        cache_dir="/cache",
+    )
+
+    subprocess.run(
+        f"ln -s {lora_model} /root/comfy/ComfyUI/models/loras/Wan2.1-Fun-14B-InP-MPS.safetensors",
+        shell=True,
+        check=True,
+    )
+
+    lora_model = hf_hub_download(
+        repo_id="Kijai/WanVideo_comfy",
+        filename="Wan21_AccVid_I2V_480P_14B_lora_rank32_fp16.safetensors",
+        cache_dir="/cache",
+    )
     
+    subprocess.run(
+        f"ln -s {lora_model} /root/comfy/ComfyUI/models/loras/Wan21_AccVid_I2V_480P_14B_lora_rank32_fp16.safetensors",
+        shell=True,
+        check=True,
+    )
+
 vol = modal.Volume.from_name("hf-hub-cache", create_if_missing=True)
 
 image = (
@@ -126,7 +181,7 @@ app = modal.App(name="wan21-fusion-x", image=image)
 
 @app.cls(
     max_containers=1,
-    gpu="T4",
+    gpu="A10G",
     volumes={"/cache": vol},
     enable_memory_snapshot=True,  # snapshot container state for faster cold starts
 )
