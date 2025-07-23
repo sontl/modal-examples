@@ -61,6 +61,17 @@ def hf_download():
     os.makedirs("/root/comfy/ComfyUI/models/text_encoders", exist_ok=True)
     os.makedirs("/root/comfy/ComfyUI/models/clip_vision", exist_ok=True)
 
+    wan_fusion_x_model = hf_hub_download(
+        repo_id="vrgamedevgirl84/Wan14BT2VFusioniX",
+        filename="Wan14BT2VFusioniX_fp16_.safetensors",
+        cache_dir="/cache",
+    )
+    subprocess.run(
+        f"ln -s {wan_fusion_x_model} /root/comfy/ComfyUI/models/diffusion_models/fusion/Wan14BT2VFusioniX_fp16_.safetensors",
+        shell=True,
+        check=True,
+    )
+    
     # Download the main Multitalk diffusion model
     multitalk_model = hf_hub_download(
         repo_id="Kijai/WanVideo_comfy",
@@ -70,6 +81,18 @@ def hf_download():
     # Symlink to ComfyUI's diffusion_models directory
     subprocess.run(
         f"ln -s {multitalk_model} /root/comfy/ComfyUI/models/diffusion_models/WanVideo_2_1_Multitalk_14B_fp8_e4m3fn.safetensors",
+        shell=True,
+        check=True,
+    )
+
+    meigen_multitalk_model = hf_hub_download(
+        repo_id="MeiGen-AI/MeiGen-MultiTalk",
+        filename="multitalk.safetensors",
+        cache_dir="/cache",
+    )
+
+    subprocess.run(
+        f"ln -s {meigen_multitalk_model} /root/comfy/ComfyUI/models/diffusion_models/multitalk.safetensors",
         shell=True,
         check=True,
     )
@@ -84,34 +107,32 @@ def hf_download():
         f"ln -s {wan_480p_i2v_model} /root/comfy/ComfyUI/models/diffusion_models/wan2.1_i2v_480p_14B_fp16.safetensors",
         shell=True,
         check=True,
-    )
-    
-    # Download the text encoder model
-    wan_text_encoder_model = hf_hub_download(
-        repo_id="city96/umt5-xxl-encoder-gguf",
-        filename="umt5-xxl-encoder-Q8_0.gguf",
+    ) 
+
+    wan_480p_i2v_fp8_model = hf_hub_download(
+        repo_id="Kijai/WanVideo_comfy",
+        filename="Wan2_1-I2V-14B-480P_fp8_e4m3fn.safetensors",
         cache_dir="/cache",
     )
 
     subprocess.run(
-        f"ln -s {wan_text_encoder_model} /root/comfy/ComfyUI/models/text_encoders/umt5-xxl-encoder-Q8_0.gguf",
+        f"ln -s {wan_480p_i2v_fp8_model} /root/comfy/ComfyUI/models/diffusion_models/Wan2_1-I2V-14B-480P_fp8_e4m3fn.safetensors",
         shell=True,
         check=True,
     )
     
-
-    # (Optional) Download the FusionX GGUF model (currently commented out)
-    # Uncomment if you want to use the FusionX GGUF model
-    # wan_fusion_x_model = hf_hub_download(
-    #     repo_id="QuantStack/Wan2.1_I2V_14B_FusionX-GGUF",
-    #     filename="Wan2.1_I2V_14B_FusionX-Q8_0.gguf",
-    #     cache_dir="/cache",
-    # )
-    # subprocess.run(
-    #     f"ln -s {wan_fusion_x_model} /root/comfy/ComfyUI/models/diffusion_models/fusion/Wan2.1_I2V_14B_FusionX-Q8_0.gguf",
-    #     shell=True,
-    #     check=True,
-    # )
+    
+    # Download the text encoder model
+    text_encoder_model = hf_hub_download(
+        repo_id="Comfy-Org/Wan_2.1_ComfyUI_repackaged",
+        filename="split_files/text_encoders/umt5_xxl_fp16.safetensors",
+        cache_dir="/cache",
+    )
+    subprocess.run(
+        f"ln -s {text_encoder_model} /root/comfy/ComfyUI/models/text_encoders/native_umt5_xxl_fp16.safetensors",
+        shell=True,
+        check=True,
+    )
 
     # Download the T2V fp16 model
     wan_fp16_model = hf_hub_download(
@@ -136,18 +157,44 @@ def hf_download():
         shell=True,
         check=True,
     )
+
+    wan_fp8_i2v_model = hf_hub_download(
+        repo_id="Kijai/WanVideo_comfy",
+        filename="Wan2_1-I2V-14B-480P_fp8_e5m2.safetensors",
+        cache_dir="/cache",
+    )
+    subprocess.run(
+        f"ln -s {wan_fp8_i2v_model} /root/comfy/ComfyUI/models/diffusion_models/Wan2_1-I2V-14B-480P_fp8_e5m2.safetensors",
+        shell=True,
+        check=True,
+    )
     
+    
+
     # Download the VAE model
-    wan_vae_model = hf_hub_download(
+    wan_vae_p32_model = hf_hub_download(
         repo_id="Kijai/WanVideo_comfy",
         filename="Wan2_1_VAE_fp32.safetensors",
         cache_dir="/cache",
     )
     subprocess.run(
-        f"ln -s {wan_vae_model} /root/comfy/ComfyUI/models/vae/Wan2_1_VAE_fp32.safetensors",
+        f"ln -s {wan_vae_p32_model} /root/comfy/ComfyUI/models/vae/Wan2_1_VAE_fp32.safetensors",
         shell=True,
         check=True,
     )
+
+    wan_vae_p16_model = hf_hub_download(
+        repo_id="Kijai/WanVideo_comfy",
+        filename="Wan2_1_VAE_bf16.safetensors",
+        cache_dir="/cache",
+    )
+
+    subprocess.run(
+        f"ln -s {wan_vae_p16_model} /root/comfy/ComfyUI/models/vae/Wan2_1_VAE_bf16.safetensors",
+        shell=True,
+        check=True,
+    )
+
 
     # Download the CLIP vision model
     wan_clip_model = hf_hub_download(
@@ -198,7 +245,7 @@ app = modal.App(name="multitalk", image=image)
 # Define the Modal class for the ComfyUI server, with memory snapshot enabled for fast cold starts.
 @app.cls(
     max_containers=1,  # Only allow one container at a time for this app
-    gpu="A10G",        # Specify the GPU type
+    gpu="L40S",        # Specify the GPU type
     volumes={"/cache": vol},  # Mount the HuggingFace cache volume
     enable_memory_snapshot=True,  # snapshot container state for faster cold starts
 )

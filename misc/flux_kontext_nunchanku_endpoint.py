@@ -112,14 +112,14 @@ with flux_kontext_nunchanku_endpoint_image.imports():
     # Supported output formats for generated images
     class OutputFormat(Enum):
         PNG = "PNG"
-        JPG = "JPG"
+        JPEG = "JPEG"  # Changed from JPG to JPEG
         WEBP = "WEBP"
 
         @property
         def mime_type(self):
             return {
                 OutputFormat.PNG: "image/png",
-                OutputFormat.JPG: "image/jpeg",
+                OutputFormat.JPEG: "image/jpeg",
                 OutputFormat.WEBP: "image/webp"
             }[self]
 
@@ -137,7 +137,7 @@ with flux_kontext_nunchanku_endpoint_image.imports():
         guidance_scale: Optional[float] = Field(default=2.5, ge=0.0, le=20.0, multiple_of=0.1)
         num_images: Optional[int] = Field(default=1, ge=1, le=4)
         seed: Optional[int] = None
-        output_format: Optional[OutputFormat] = Field(default=OutputFormat.PNG)
+        output_format: Optional[OutputFormat] = Field(default=OutputFormat.JPEG)
         output_quality: Optional[int] = Field(default=90, ge=1, le=100)
 
 # ## The FluxKontextnunchankuService class
@@ -249,6 +249,14 @@ class FluxKontextnunchankuService:
             f"mit-han-lab/nunchaku-flux.1-kontext-dev/svdq-{precision}_r32-flux.1-kontext-dev.safetensors"
         )
         transformer.set_attention_impl("nunchaku-fp16")
+
+        ### LoRA Related Code ###
+        # transformer.update_lora_params(
+        #     "alimama-creative/FLUX.1-Turbo-Alpha/diffusion_pytorch_model.safetensors"
+        # )  # Path to your LoRA safetensors, can also be a remote HuggingFace path
+        # transformer.set_lora_strength(1)  # Your LoRA strength here
+        ### End of LoRA Related Code ###
+
         
         # Set the transformer in the pipeline
         self.pipe.transformer = transformer
@@ -298,6 +306,8 @@ class FluxKontextnunchankuService:
             pipe_args["num_images_per_prompt"] = request.num_images
         if generator is not None:
             pipe_args["generator"] = generator
+        
+        # pipe_args["num_inference_steps"] = 8
 
         images = self.pipe(**pipe_args).images
 
@@ -314,7 +324,7 @@ class FluxKontextnunchankuService:
             images[0].save(
                 byte_stream, 
                 format=request.output_format.value,
-                quality=request.output_quality if request.output_format in [OutputFormat.JPG, OutputFormat.WEBP] else None
+                quality=request.output_quality if request.output_format in [OutputFormat.JPEG, OutputFormat.WEBP] else None
             )
             return Response(
                 content=byte_stream.getvalue(),
@@ -330,7 +340,7 @@ class FluxKontextnunchankuService:
             image.save(
                 byte_stream, 
                 format=request.output_format.value,
-                quality=request.output_quality if request.output_format in [OutputFormat.JPG, OutputFormat.WEBP] else None
+                quality=request.output_quality if request.output_format in [OutputFormat.JPEG, OutputFormat.WEBP] else None
             )
             return byte_stream.getvalue()
 
