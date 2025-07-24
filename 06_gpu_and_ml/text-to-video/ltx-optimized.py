@@ -25,8 +25,9 @@
 import string
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Annotated, Optional
 
+import fastapi
 import modal
 
 app = modal.App("example-ltx-video")
@@ -71,6 +72,7 @@ image = (
     )
     .pip_install(
         "accelerate",
+        "fastapi[standard]==0.115.8",
         "hf_transfer",
         "imageio",
         "imageio-ffmpeg",
@@ -128,12 +130,14 @@ MINUTES = 60  # seconds
     },
     gpu="L40S",
     timeout=10 * MINUTES,
-    scaledown_window=15 * MINUTES,
+    scaledown_window=1 * MINUTES,
     enable_memory_snapshot=True,
 )
 class LTX:
-
+    
     def _optimize(self):
+        import torch
+
         # torch compile configs
         config = torch._inductor.config
         config.conv_1x1_as_mm = True
@@ -143,34 +147,15 @@ class LTX:
         config.epilogue_fusion = False
         config.shape_padding = True
 
-        # mark layers for compilation with dynamic shapes enabled
+        self.pipe.transformer.to(memory_format=torch.channels_last)
         self.pipe.transformer = torch.compile(
-            self.pipe.transformer, mode="max-autotune-no-cudagraphs", dynamic=True
-        )
-
-        self.pipe.vae.decode = torch.compile(
-            self.pipe.vae.decode, mode="max-autotune-no-cudagraphs", dynamic=True
+            self.pipe.transformer, mode="max-autotune", fullgraph=True
         )
 
     def _compile(self):
         # monkey-patch torch inductor remove_noop_ops pass for dynamic compilation
         # swallow AttributeError: 'SymFloat' object has no attribute 'size' and return false
-        from torch._inductor.fx_passes import post_grad
         import torch
-
-        if not hasattr(post_grad, "_orig_same_meta"):
-            post_grad._orig_same_meta = post_grad.same_meta
-
-            def _safe_same_meta(node1, node2):
-                try:
-                    return post_grad._orig_same_meta(node1, node2)
-                except AttributeError as e:
-                    if "SymFloat" in str(e) and "size" in str(e):
-                        # return not the same, instead of crashing
-                        return False
-                    raise
-
-            post_grad.same_meta = _safe_same_meta
 
         # Trigger compilation with a sample prompt
         print("triggering torch compile")
@@ -187,6 +172,7 @@ class LTX:
 
     def _load_mega_cache(self):
         print("loading torch mega-cache")
+        import torch
         try:
             if self.mega_cache_bin_path.exists():
                 with open(self.mega_cache_bin_path, "rb") as f:
@@ -200,6 +186,7 @@ class LTX:
             print(f"error loading torch mega-cache: {e}")
 
     def _save_mega_cache(self):
+        import torch
         print("saving torch mega-cache")
         try:
             artifacts = torch.compiler.save_cache_artifacts()
@@ -293,43 +280,82 @@ class LTX:
             output_type="latent",
         ).frames
 
-        # # 2. Upscale generated video using latent upsampler
-        # upscaled_height, upscaled_width = downscaled_height * 2, downscaled_width * 2
-        # upscaled_latents = self.pipe_upsample(
-        #     latents=latents,
-        #     adain_factor=adain_factor,
-        #     output_type="latent"
-        # ).frames
+        # 2. Upscale generated video using latent upsampler
+        upscaled_height, upscaled_width = downscaled_height * 2, downscaled_width * 2
+        upscaled_latents = self.pipe_upsample(
+            latents=latents,
+            adain_factor=adain_factor,
+            output_type="latent"
+        ).frames
 
-        # # 3. Denoise the upscaled video with few steps to improve texture
-        # video = self.pipe(
-        #     prompt=prompt,
-        #     negative_prompt=negative_prompt,
-        #     width=upscaled_width,
-        #     height=upscaled_height,
-        #     num_frames=num_frames,
-        #     denoise_strength=denoise_strength,
-        #     timesteps=[1000, 909, 725, 421, 0],
-        #     latents=upscaled_latents,
-        #     decode_timestep=decode_timestep,
-        #     decode_noise_scale=decode_noise_scale,
-        #     image_cond_noise_scale=image_cond_noise_scale,
-        #     guidance_scale=guidance_scale,
-        #     guidance_rescale=guidance_rescale,
-        #     generator=torch.Generator().manual_seed(0),
-        #     output_type="pil",
-        # ).frames[0]
+        # 3. Denoise the upscaled video with few steps to improve texture
+        video = self.pipe(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            width=upscaled_width,
+            height=upscaled_height,
+            num_frames=num_frames,
+            denoise_strength=denoise_strength,
+            timesteps=[1000, 909, 725, 421, 0],
+            latents=upscaled_latents,
+            decode_timestep=decode_timestep,
+            decode_noise_scale=decode_noise_scale,
+            image_cond_noise_scale=image_cond_noise_scale,
+            guidance_scale=guidance_scale,
+            guidance_rescale=guidance_rescale,
+            generator=torch.Generator().manual_seed(0),
+            output_type="pil",
+        ).frames[0]
 
         # 4. Downscale the video to the expected resolution if needed
         # if upscaled_height != height or upscaled_width != width:
         #     video = [frame.resize((width, height)) for frame in video]
 
         # save to disk using prompt as filename
-        video = latents
         mp4_name = slugify(prompt)
         export_to_video(video, Path(OUTPUTS_PATH) / mp4_name, fps=24)
         outputs.commit()
         return mp4_name
+
+    @modal.fastapi_endpoint(method="POST", docs=True)
+    def web(
+        self,
+        prompt: str,
+        negative_prompt: Optional[str] = None,
+        num_frames: Optional[int] = None,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        guidance_scale: Optional[float] = None,
+        guidance_rescale: Optional[float] = None,
+        decode_timestep: Optional[float] = None,
+        decode_noise_scale: Optional[float] = None,
+        image_cond_noise_scale: Optional[float] = None,
+        downscale_factor: Optional[float] = None,
+        adain_factor: Optional[float] = None,
+        denoise_strength: Optional[float] = None,
+    ):
+        import fastapi
+        
+        mp4_name = self.generate.local(  # run in the same container
+            prompt=prompt,
+            negative_prompt=negative_prompt or "worst quality, inconsistent motion, blurry, jittery, distorted",
+            num_frames=num_frames or 161,
+            width=width or 1152,
+            height=height or 768,
+            guidance_scale=guidance_scale or 1.0,
+            guidance_rescale=guidance_rescale or 0.7,
+            decode_timestep=decode_timestep or 0.05,
+            decode_noise_scale=decode_noise_scale or 0.025,
+            image_cond_noise_scale=image_cond_noise_scale or 0.0,
+            downscale_factor=downscale_factor or 2/3,
+            adain_factor=adain_factor or 1.0,
+            denoise_strength=denoise_strength or 0.999,
+        )
+        return fastapi.responses.FileResponse(
+            path=f"{Path(OUTPUTS_PATH) / mp4_name}",
+            media_type="video/mp4",
+            filename=mp4_name,
+        )
 
 
 # ## Generate videos from the command line
