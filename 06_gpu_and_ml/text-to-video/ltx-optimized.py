@@ -31,24 +31,6 @@ import modal
 
 app = modal.App("example-ltx-video")
 
-image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .apt_install("git")
-    .run_commands(
-        "pip install git+https://github.com/huggingface/diffusers.git",
-    )
-    .pip_install(
-        "accelerate",
-        "hf_transfer",
-        "imageio",
-        "imageio-ffmpeg",
-        "sentencepiece",
-        "torch",
-        "transformers",
-    )
-    
-    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
-)
 
 # ## Storing data on Modal Volumes
 
@@ -74,16 +56,46 @@ OUTPUTS_PATH = Path("/outputs")
 MODEL_VOLUME_NAME = "ltx-model"
 model = modal.Volume.from_name(MODEL_VOLUME_NAME, create_if_missing=True)
 
+# Add a cache volume for compiled model artifacts
+CONTAINER_CACHE_DIR = Path("/cache")
+CONTAINER_CACHE_VOLUME = modal.Volume.from_name("ltx-cache", create_if_missing=True)
+
+# For more on storing Modal weights on Modal, see
+# [this guide](https://modal.com/docs/guide/model-weights).
+
+image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .apt_install("git")
+    .run_commands(
+        "pip install git+https://github.com/huggingface/diffusers.git",
+    )
+    .pip_install(
+        "accelerate",
+        "hf_transfer",
+        "imageio",
+        "imageio-ffmpeg",
+        "sentencepiece",
+        "torch",
+        "transformers",
+    )
+    
+    .env({
+        "HF_HUB_ENABLE_HF_TRANSFER": "1",
+        "TORCHINDUCTOR_FX_GRAPH_CACHE": "1",
+        "CUDA_CACHE_PATH": str(CONTAINER_CACHE_DIR / ".nv_cache"),
+        "HF_HUB_CACHE": str(CONTAINER_CACHE_DIR / ".hf_hub_cache"),
+        "TORCHINDUCTOR_CACHE_DIR": str(CONTAINER_CACHE_DIR / ".inductor_cache"),
+        "TRITON_CACHE_DIR": str(CONTAINER_CACHE_DIR / ".triton_cache"),
+        "TORCH_COMPILE_DEBUG": "0",  # Enable debug info for torch.compile
+    })
+)
+
 # We don't have to change any of the Hugging Face code to do this --
 # we just set the location of Hugging Face's cache to be on a Volume
 # using the `HF_HOME` environment variable.
 
 MODEL_PATH = Path("/models")
 image = image.env({"HF_HOME": str(MODEL_PATH)})
-
-# For more on storing Modal weights on Modal, see
-# [this guide](https://modal.com/docs/guide/model-weights).
-
 
 # ## Setting up our LTX class
 
@@ -109,27 +121,105 @@ MINUTES = 60  # seconds
 
 @app.cls(
     image=image,
-    volumes={OUTPUTS_PATH: outputs, MODEL_PATH: model},
-    gpu="H100",
+    volumes={
+        OUTPUTS_PATH: outputs, 
+        MODEL_PATH: model,
+        CONTAINER_CACHE_DIR: CONTAINER_CACHE_VOLUME
+    },
+    gpu="L40S",
     timeout=10 * MINUTES,
     scaledown_window=15 * MINUTES,
+    enable_memory_snapshot=True,
 )
 class LTX:
-    @modal.enter()
+
+    def _optimize(self):
+        # torch compile configs
+        config = torch._inductor.config
+        config.conv_1x1_as_mm = True
+        config.coordinate_descent_check_all_directions = True
+        config.coordinate_descent_tuning = True
+        config.disable_progress = False
+        config.epilogue_fusion = False
+        config.shape_padding = True
+
+        # mark layers for compilation with dynamic shapes enabled
+        self.pipe.transformer = torch.compile(
+            self.pipe.transformer, mode="max-autotune-no-cudagraphs", dynamic=True
+        )
+
+        self.pipe.vae.decode = torch.compile(
+            self.pipe.vae.decode, mode="max-autotune-no-cudagraphs", dynamic=True
+        )
+
+    def _compile(self):
+        # monkey-patch torch inductor remove_noop_ops pass for dynamic compilation
+        # swallow AttributeError: 'SymFloat' object has no attribute 'size' and return false
+        from torch._inductor.fx_passes import post_grad
+        import torch
+
+        if not hasattr(post_grad, "_orig_same_meta"):
+            post_grad._orig_same_meta = post_grad.same_meta
+
+            def _safe_same_meta(node1, node2):
+                try:
+                    return post_grad._orig_same_meta(node1, node2)
+                except AttributeError as e:
+                    if "SymFloat" in str(e) and "size" in str(e):
+                        # return not the same, instead of crashing
+                        return False
+                    raise
+
+            post_grad.same_meta = _safe_same_meta
+
+        # Trigger compilation with a sample prompt
+        print("triggering torch compile")
+        self.pipe(
+            prompt="a person walking",
+            negative_prompt="worst quality, inconsistent motion, blurry, jittery, distorted",
+            width=384,
+            height=256,
+            num_frames=8,
+            guidance_scale=1.0,
+            generator=torch.Generator().manual_seed(0),
+            output_type="latent",
+        )
+
+    def _load_mega_cache(self):
+        print("loading torch mega-cache")
+        try:
+            if self.mega_cache_bin_path.exists():
+                with open(self.mega_cache_bin_path, "rb") as f:
+                    artifact_bytes = f.read()
+
+                if artifact_bytes:
+                    torch.compiler.load_cache_artifacts(artifact_bytes)
+            else:
+                print("torch mega cache not found, regenerating...")
+        except Exception as e:
+            print(f"error loading torch mega-cache: {e}")
+
+    def _save_mega_cache(self):
+        print("saving torch mega-cache")
+        try:
+            artifacts = torch.compiler.save_cache_artifacts()
+            artifact_bytes, _ = artifacts
+
+            with open(self.mega_cache_bin_path, "wb") as f:
+                f.write(artifact_bytes)
+
+            # persist changes to volume
+            CONTAINER_CACHE_VOLUME.commit()
+        except Exception as e:
+            print(f"error saving torch mega-cache: {e}")
+
+    @modal.enter(snap=True)
     def load_model(self):
         import torch
         from diffusers import LTXConditionPipeline, LTXLatentUpsamplePipeline, AutoModel
         from diffusers.hooks import apply_group_offloading
 
-        # transformer = AutoModel.from_pretrained(
-        #     "Lightricks/LTX-Video-0.9.7-distilled",
-        #     subfolder="transformer",
-        #     torch_dtype=torch.bfloat16
-        # )
-        # transformer.enable_layerwise_casting(
-        #     storage_dtype=torch.float8_e4m3fn, compute_dtype=torch.bfloat16
-        # )
-
+        print("downloading (if necessary) and loading model")
         # Initialize condition pipeline
         self.pipe = LTXConditionPipeline.from_pretrained(
             "Lightricks/LTX-Video-0.9.7-distilled", 
@@ -142,34 +232,22 @@ class LTX:
             vae=self.pipe.vae,
             torch_dtype=torch.bfloat16
         )
+        
+        # Set up mega cache paths
+        mega_cache_dir = CONTAINER_CACHE_DIR / ".mega_cache"
+        mega_cache_dir.mkdir(parents=True, exist_ok=True)
+        self.mega_cache_bin_path = mega_cache_dir / "ltx_torch_mega"
 
-        # Configure group-offloading for memory optimization
-        # onload_device = torch.device("cuda")
-        # offload_device = torch.device("cpu")
-        
-        # Apply group offloading to different components
-                # Apply group offloading to different components
-        # self.pipe.transformer.enable_group_offload(
-        #     onload_device=onload_device, 
-        #     offload_device=offload_device, 
-        #     offload_type="leaf_level", 
-        #     use_stream=True
-        # )
-        # apply_group_offloading(
-        #     self.pipe.text_encoder, 
-        #     onload_device=onload_device, 
-        #     offload_type="block_level", 
-        #     num_blocks_per_group=2
-        # )
-        # apply_group_offloading(
-        #     self.pipe.vae, 
-        #     onload_device=onload_device, 
-        #     offload_type="leaf_level"
-        # )
-        
+    @modal.enter(snap=False)
+    def setup(self):
         self.pipe.to("cuda")
         self.pipe_upsample.to("cuda")
         self.pipe.vae.enable_tiling()
+        
+        self._load_mega_cache()
+        self._optimize()
+        self._compile()
+        self._save_mega_cache()
 
     def round_to_nearest_resolution_acceptable_by_vae(self, height, width):
         height = height - (height % self.pipe.vae_temporal_compression_ratio)
@@ -313,9 +391,6 @@ def main(
     prompts = [
         "A majestic eagle soaring through a sunset-lit canyon, wings spread wide against the orange sky",
         "A professional chef preparing sushi in a modern kitchen, with precise knife movements and artistic plating",
-        "A street performer doing an acrobatic dance routine in Times Square, surrounded by amazed onlookers",
-        "A young artist painting a vibrant mural on a city wall, with colorful paint splatters and dynamic brushstrokes",
-        "A group of dolphins jumping through ocean waves at sunrise, creating beautiful water splashes",
     ]
 
     ltx = LTX()
