@@ -1,0 +1,313 @@
+{
+  "1425": {
+    "inputs": {
+      "model_name": "RealESRGAN_x2plus.pth"
+    },
+    "class_type": "UpscaleModelLoader",
+    "_meta": {
+      "title": "Load Upscale Model"
+    }
+  },
+  "1426": {
+    "inputs": {
+      "upscale_model": [
+        "1425",
+        0
+      ],
+      "image": [
+        "1479",
+        0
+      ]
+    },
+    "class_type": "ImageUpscaleWithModel",
+    "_meta": {
+      "title": "Upscale Image (using Model)"
+    }
+  },
+  "1427": {
+    "inputs": {
+      "width": 1,
+      "height": 1,
+      "upscale_method": "nearest-exact",
+      "keep_proportion": false,
+      "divisible_by": 16,
+      "crop": "center",
+      "image": [
+        "1426",
+        0
+      ],
+      "width_input": [
+        "1428",
+        0
+      ],
+      "height_input": [
+        "1428",
+        2
+      ]
+    },
+    "class_type": "ImageResizeKJ",
+    "_meta": {
+      "title": "Resize Image"
+    }
+  },
+  "1428": {
+    "inputs": {
+      "value_1": "a*1.5",
+      "value_2": "b*1.5",
+      "a": [
+        "1589",
+        0
+      ],
+      "b": [
+        "1589",
+        1
+      ]
+    },
+    "class_type": "SimpleMathDual+",
+    "_meta": {
+      "title": "🔧 Simple Math Dual"
+    }
+  },
+  "1434": {
+    "inputs": {
+      "text": "Overexposure, static, blurred details, subtitles, still, overall gray, worst quality, low quality, JPEG compression residue, ugly, mutilated, redundant fingers, poorly painted hands, poorly painted faces, deformed, disfigured, deformed limbs, fused fingers, cluttered background, three legs, a lot of people in the background, upside down, white flashlights, glow light effect, post edit, ugly distorted hands, scrambled fingers, wild arm movement, text, icons, logo, post production, slow motion, bullet time effect",
+      "clip": [
+        "1535",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP encode negative"
+    }
+  },
+  "1435": {
+    "inputs": {
+      "frame_rate": 30,
+      "loop_count": 0,
+      "filename_prefix": "wan2/upscaled/v2v",
+      "format": "video/h264-mp4",
+      "pix_fmt": "yuv420p",
+      "crf": 10,
+      "save_metadata": true,
+      "trim_to_audio": false,
+      "pingpong": false,
+      "save_output": true,
+      "images": [
+        "1526",
+        0
+      ]
+    },
+    "class_type": "VHS_VideoCombine",
+    "_meta": {
+      "title": "Video Combine 🎥🅥🅗🅢"
+    }
+  },
+  "1436": {
+    "inputs": {
+      "shift": 5.000000000000001,
+      "model": [
+        "1440",
+        0
+      ]
+    },
+    "class_type": "ModelSamplingSD3",
+    "_meta": {
+      "title": "ModelSamplingSD3"
+    }
+  },
+  "1437": {
+    "inputs": {
+      "clip_name": "umt5-xxl-encoder-Q6_K.gguf",
+      "type": "wan"
+    },
+    "class_type": "CLIPLoaderGGUF",
+    "_meta": {
+      "title": "CLIPLoader (GGUF)"
+    }
+  },
+  "1438": {
+    "inputs": {
+      "vae_name": "wan_2.1_vae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Load VAE"
+    }
+  },
+  "1439": {
+    "inputs": {
+      "text": "detailed, high quality",
+      "clip": [
+        "1535",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Encode positive"
+    }
+  },
+  "1440": {
+    "inputs": {
+      "blocks": "9",
+      "start_percent": 0,
+      "end_percent": 1,
+      "model": [
+        "1442",
+        0
+      ]
+    },
+    "class_type": "SkipLayerGuidanceWanVideo",
+    "_meta": {
+      "title": "Skip Layer Guidance WanVideo"
+    }
+  },
+  "1441": {
+    "inputs": {
+      "seed": 1111846751318810,
+      "steps": 4,
+      "cfg": 1,
+      "sampler_name": "uni_pc",
+      "scheduler": "kl_optimal",
+      "denoise": 0.20000000000000004,
+      "model": [
+        "1436",
+        0
+      ],
+      "positive": [
+        "1439",
+        0
+      ],
+      "negative": [
+        "1434",
+        0
+      ],
+      "latent_image": [
+        "1527",
+        0
+      ]
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "KSampler"
+    }
+  },
+  "1442": {
+    "inputs": {
+      "rel_l1_thresh": 0.25000000000000006,
+      "start_percent": 0,
+      "end_percent": 1,
+      "cache_device": "offload_device",
+      "coefficients": "1.3B",
+      "model": [
+        "1535",
+        0
+      ]
+    },
+    "class_type": "WanVideoTeaCacheKJ",
+    "_meta": {
+      "title": "WanVideo Tea Cache (native)"
+    }
+  },
+  "1443": {
+    "inputs": {
+      "unet_name": "Wan2_1-T2V-1_3B_bf16.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "Load Diffusion Model"
+    }
+  },
+  "1479": {
+    "inputs": {
+      "video": "FramePack_00080.mp4",
+      "force_rate": 0,
+      "custom_width": 0,
+      "custom_height": 0,
+      "frame_load_cap": 80,
+      "skip_first_frames": 0,
+      "select_every_nth": 1,
+      "format": "AnimateDiff"
+    },
+    "class_type": "VHS_LoadVideo",
+    "_meta": {
+      "title": "Load Video (Upload) 🎥🅥🅗🅢"
+    }
+  },
+  "1526": {
+    "inputs": {
+      "samples": [
+        "1441",
+        0
+      ],
+      "vae": [
+        "1438",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "1527": {
+    "inputs": {
+      "pixels": [
+        "1427",
+        0
+      ],
+      "vae": [
+        "1438",
+        0
+      ]
+    },
+    "class_type": "VAEEncode",
+    "_meta": {
+      "title": "VAE Encode"
+    }
+  },
+  "1535": {
+    "inputs": {
+      "PowerLoraLoaderHeaderWidget": {
+        "type": "PowerLoraLoaderHeaderWidget"
+      },
+      "lora_1": {
+        "on": true,
+        "lora": "wanLora\\Wan21_CausVid_bidirect2_T2V_1_3B_lora_rank32.safetensors",
+        "strength": 1
+      },
+      "lora_2": {
+        "on": false,
+        "lora": "wanLora\\eye_epoch10--3y3_cl053 eye extreme close up.safetensors",
+        "strength": 0.7
+      },
+      "➕ Add Lora": "",
+      "model": [
+        "1443",
+        0
+      ],
+      "clip": [
+        "1437",
+        0
+      ]
+    },
+    "class_type": "Power Lora Loader (rgthree)",
+    "_meta": {
+      "title": "Power Lora Loader (rgthree)"
+    }
+  },
+  "1589": {
+    "inputs": {
+      "image": [
+        "1479",
+        0
+      ]
+    },
+    "class_type": "GetImageSize+",
+    "_meta": {
+      "title": "🔧 Get Image Size"
+    }
+  }
+}

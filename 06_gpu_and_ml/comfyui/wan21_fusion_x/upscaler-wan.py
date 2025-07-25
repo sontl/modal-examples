@@ -5,9 +5,11 @@
 
 # Image building and model downloading is directly taken from the core example: https://modal.com/docs/examples/comfyapp
 # The notable changes are copying the custom node in the image and the cls object
+import json
 import subprocess
+import uuid
 from pathlib import Path
-
+from typing import Dict
 import modal
 
 image = (
@@ -55,6 +57,8 @@ def hf_download():
     os.makedirs("/root/comfy/ComfyUI/models/vae", exist_ok=True)
     os.makedirs("/root/comfy/ComfyUI/models/text_encoders", exist_ok=True)
     os.makedirs("/root/comfy/ComfyUI/models/clip_vision", exist_ok=True)
+    os.makedirs("/root/comfy/ComfyUI/models/diffusion_models", exist_ok=True)
+    os.makedirs("/root/comfy/ComfyUI/models/upscale_models", exist_ok=True)
 
     wan_1_3_B_model = hf_hub_download(
         repo_id="Kijai/WanVideo_comfy",
@@ -104,40 +108,17 @@ def hf_download():
         check=True,
     )
     
-    # download LoRA models
-    os.makedirs("/root/comfy/ComfyUI/models/loras", exist_ok=True)
+    # download LoRA models - create wanLora subdirectory to match workflow expectations
+    os.makedirs("/root/comfy/ComfyUI/models/loras/wanLora", exist_ok=True)
+    
     lora_model = hf_hub_download(
         repo_id="Kijai/WanVideo_comfy",
-        filename="Wan21_CausVid_14B_T2V_lora_rank32_v2.safetensors",
+        filename="Wan21_CausVid_bidirect2_T2V_1_3B_lora_rank32.safetensors",
         cache_dir="/cache",
     )
 
     subprocess.run(
-        f"ln -s {lora_model} /root/comfy/ComfyUI/models/loras/Wan21_CausVid_14B_T2V_lora_rank32_v2.safetensors",
-        shell=True,
-        check=True,
-    )
-
-    lora_model = hf_hub_download(
-        repo_id="Kijai/WanVideo_comfy",
-        filename="Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank32.safetensors",
-        cache_dir="/cache",
-    )
-
-    subprocess.run(
-        f"ln -s {lora_model} /root/comfy/ComfyUI/models/loras/Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank32.safetensors",
-        shell=True,
-        check=True,
-    )
-
-    lora_model = hf_hub_download(
-        repo_id="alibaba-pai/Wan2.1-Fun-Reward-LoRAs",
-        filename="Wan2.1-Fun-14B-InP-MPS.safetensors",
-        cache_dir="/cache",
-    )
-
-    subprocess.run(
-        f"ln -s {lora_model} /root/comfy/ComfyUI/models/loras/Wan2.1-Fun-14B-InP-MPS.safetensors",
+        f"ln -s {lora_model} /root/comfy/ComfyUI/models/loras/wanLora/Wan21_CausVid_bidirect2_T2V_1_3B_lora_rank32.safetensors",
         shell=True,
         check=True,
     )
@@ -155,7 +136,7 @@ image = (
 
 # Lastly, copy the ComfyUI workflow JSON to the container.
 image = image.add_local_file(
-    Path(__file__).parent / "AiArtistryAtelierVideoUpscalingWF.json", "/root/AiArtistryAtelierVideoUpscalingWF.json"
+    Path(__file__).parent / "VideoUpscalerAPI.json", "/root/VideoUpscalerAPI.json", copy=True
 )
 
 app = modal.App(name="upscaler-wan", image=image)
@@ -188,8 +169,162 @@ class UpscalerWan:
         else:
             print("Successfully set CUDA device")
 
+    @modal.method()
+    def infer(self, workflow_path: str = "/root/VideoUpscalerAPI.json"):
+        # sometimes the ComfyUI server stops responding (we think because of memory leaks), so this makes sure it's still up
+        self.poll_server_health()
+
+        # runs the comfy run --workflow command as a subprocess
+        cmd = f"comfy run --workflow {workflow_path} --wait --timeout 1200 --verbose"
+        subprocess.run(cmd, shell=True, check=True)
+
+        # completed workflows write output images to this directory
+        output_dir = "/root/comfy/ComfyUI/output"
+
+        # looks up the name of the output image file based on the workflow
+        workflow = json.loads(Path(workflow_path).read_text())
+        file_prefix = [
+            node.get("inputs")
+            for node in workflow.values()
+            if node.get("class_type") == "VHS_VideoCombine"
+        ][0]["filename_prefix"]
+
+        # returns the video as bytes
+        for f in Path(output_dir).iterdir():
+            if f.name.startswith(file_prefix) and f.suffix in ['.mp4', '.avi', '.mov']:
+                return f.read_bytes()
+        
+        # If no video file found, raise an error
+        raise FileNotFoundError(f"No video output found with prefix: {file_prefix}")
+
+    @modal.fastapi_endpoint(method="POST")
+    def api(self, video_filename: str):
+        from fastapi import Response
+
+        # Load the workflow template
+        workflow_data = json.loads(Path("/root/VideoUpscalerAPI.json").read_text())
+
+        # Update the video input - expecting video filename in the request
+        workflow_data["1479"]["inputs"]["video"] = video_filename
+
+        # Give the output video a unique id per client request
+        client_id = uuid.uuid4().hex
+        workflow_data["1435"]["inputs"]["filename_prefix"] = f"upscaled_{client_id}"
+
+        # Save this updated workflow to a new file
+        new_workflow_file = f"/tmp/{client_id}.json"
+        with open(new_workflow_file, "w") as f:
+            json.dump(workflow_data, f)
+
+        # Run inference on the currently running container
+        video_bytes = self.infer.local(new_workflow_file)
+
+        return Response(video_bytes, media_type="video/mp4")
+
+    @modal.method()
+    def process_video_bytes(self, video: bytes):
+        """Process video bytes and return upscaled video bytes"""
+        # Save uploaded video to ComfyUI input directory
+        client_id = uuid.uuid4().hex
+        video_filename = f"input_{client_id}.mp4"
+        input_dir = Path("/root/comfy/ComfyUI/input")
+        input_dir.mkdir(exist_ok=True)
+        
+        video_path = input_dir / video_filename
+        video_path.write_bytes(video)
+
+        # Load the workflow template
+        workflow_data = json.loads(Path("/root/VideoUpscalerAPI.json").read_text())
+
+        # Update the video input
+        workflow_data["1479"]["inputs"]["video"] = video_filename
+
+        # Give the output video a unique id per client request
+        workflow_data["1435"]["inputs"]["filename_prefix"] = f"upscaled_{client_id}"
+
+        # Save this updated workflow to a new file
+        new_workflow_file = f"/tmp/{client_id}.json"
+        with open(new_workflow_file, "w") as f:
+            json.dump(workflow_data, f)
+
+        # Run inference on the currently running container
+        video_bytes = self.infer.local(new_workflow_file)
+
+        # Clean up input file
+        video_path.unlink(missing_ok=True)
+
+        return video_bytes
+
+    @modal.fastapi_endpoint(method="POST", label="upload-and-upscale")
+    def upload_and_upscale(self, video: bytes):
+        from fastapi import Response
+
+        # Process the video using the local method
+        video_bytes = self.process_video_bytes.local(video)
+        return Response(video_bytes, media_type="video/mp4")
+
+    def poll_server_health(self) -> Dict:
+        import socket
+        import urllib
+
+        try:
+            # check if the server is up (response should be immediate)
+            req = urllib.request.Request(f"http://127.0.0.1:{self.port}/system_stats")
+            urllib.request.urlopen(req, timeout=5)
+            print("ComfyUI server is healthy")
+        except (socket.timeout, urllib.error.URLError) as e:
+            # if no response in 5 seconds, stop the container
+            print(f"Server health check failed: {str(e)}")
+            modal.experimental.stop_fetching_inputs()
+
+            # all queued inputs will be marked "Failed", so you need to catch these errors in your client and then retry
+            raise Exception("ComfyUI server is not healthy, stopping container")
+
+
+
     @modal.web_server(port, startup_timeout=60)
     def ui(self):
         subprocess.Popen(
             f"comfy launch -- --listen 0.0.0.0 --port {self.port}", shell=True
         )
+
+
+# Create a separate FastAPI app for file uploads
+@app.function(
+    image=image.pip_install("python-multipart"),
+    volumes={"/cache": vol},
+)
+@modal.asgi_app()
+def fastapi_app():
+    from fastapi import FastAPI, File, UploadFile, HTTPException
+    from fastapi.responses import Response
+    import tempfile
+
+    web_app = FastAPI(title="Video Upscaler API", docs_url="/docs")
+
+    @web_app.post("/upscale")
+    async def upscale_video(video: UploadFile = File(...)):
+        """Upload a video file and get back an upscaled version"""
+        
+        # Validate file type
+        if not video.content_type or not video.content_type.startswith('video/'):
+            raise HTTPException(status_code=400, detail="File must be a video")
+        
+        # Read video content
+        video_content = await video.read()
+        
+        # Call the upscaler using the remote method
+        upscaler = UpscalerWan()
+        result_bytes = upscaler.process_video_bytes.remote(video_content)
+        
+        return Response(
+            content=result_bytes,
+            media_type="video/mp4",
+            headers={"Content-Disposition": f"attachment; filename=upscaled_{video.filename}"}
+        )
+
+    @web_app.get("/")
+    def root():
+        return {"message": "Video Upscaler API - Use POST /upscale to upload and upscale videos"}
+
+    return web_app
