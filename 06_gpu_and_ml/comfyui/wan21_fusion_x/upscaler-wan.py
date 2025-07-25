@@ -295,7 +295,14 @@ class UpscalerWan:
 @app.function(
     image=image.pip_install("python-multipart"),
     volumes={"/cache": vol},
+    min_containers=0,
+    scaledown_window=60 * 5,
+    # gradio requires sticky sessions
+    # so we limit the number of concurrent containers to 1
+    # and allow it to scale to 100 concurrent inputs
+    max_containers=1,
 )
+@modal.concurrent(max_inputs=1000)
 @modal.asgi_app()
 def fastapi_app():
     from fastapi import FastAPI, File, UploadFile, HTTPException
