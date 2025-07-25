@@ -146,6 +146,8 @@ app = modal.App(name="upscaler-wan", image=image)
     max_containers=1,
     gpu="L4",
     volumes={"/cache": vol},
+    timeout=3600,
+    scaledown_window=30,  # 5 minutes
     enable_memory_snapshot=True,  # snapshot container state for faster cold starts
 )
 @modal.concurrent(max_inputs=10)

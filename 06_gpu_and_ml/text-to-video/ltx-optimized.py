@@ -1,7 +1,8 @@
-# # Generate videos from prompts with Lightricks LTX-Video
+# # Generate videos from prompts and images with Lightricks LTX-Video
 
 # This example demonstrates how to run the [LTX-Video](https://github.com/Lightricks/LTX-Video)
 # video generation model by [Lightricks](https://www.lightricks.com/) on Modal.
+# It supports both text-to-video and image-to-video generation.
 
 # LTX-Video is fast! Generating a twenty second 480p video at moderate quality
 # takes as little as two seconds on a warm container.
@@ -22,6 +23,7 @@
 # that our video model will run in.
 
 
+import io
 import string
 import time
 from pathlib import Path
@@ -76,6 +78,7 @@ image = (
         "hf_transfer",
         "imageio",
         "imageio-ffmpeg",
+        "pillow",
         "sentencepiece",
         "torch",
         "transformers",
@@ -147,19 +150,22 @@ class LTX:
         config.epilogue_fusion = False
         config.shape_padding = True
 
-        self.pipe.transformer.to(memory_format=torch.channels_last)
-        self.pipe.transformer = torch.compile(
-            self.pipe.transformer, mode="max-autotune", fullgraph=True
+        self.pipe_image_to_video.transformer.to(memory_format=torch.channels_last)
+        self.pipe_image_to_video.transformer = torch.compile(
+            self.pipe_image_to_video.transformer, mode="max-autotune", fullgraph=True
         )
 
     def _compile(self):
         # monkey-patch torch inductor remove_noop_ops pass for dynamic compilation
         # swallow AttributeError: 'SymFloat' object has no attribute 'size' and return false
         import torch
+        from PIL import Image
 
-        # Trigger compilation with a sample prompt
+        # Trigger compilation with a sample prompt and dummy image
         print("triggering torch compile")
-        self.pipe(
+        dummy_image = Image.new('RGB', (384, 256), color='black')
+        self.pipe_image_to_video(
+            image=dummy_image,
             prompt="a person walking",
             negative_prompt="worst quality, inconsistent motion, blurry, jittery, distorted",
             width=384,
@@ -203,20 +209,26 @@ class LTX:
     @modal.enter(snap=True)
     def load_model(self):
         import torch
-        from diffusers import LTXConditionPipeline, LTXLatentUpsamplePipeline, AutoModel
+        from diffusers import LTXConditionPipeline, LTXLatentUpsamplePipeline, LTXImageToVideoPipeline, AutoModel
         from diffusers.hooks import apply_group_offloading
 
         print("downloading (if necessary) and loading model")
         # Initialize condition pipeline
-        self.pipe = LTXConditionPipeline.from_pretrained(
-            "Lightricks/LTX-Video-0.9.7-distilled", 
+        # self.pipe = LTXConditionPipeline.from_pretrained(
+        #     "Lightricks/LTX-Video-0.9.7-distilled", 
+        #     torch_dtype=torch.bfloat16,
+        # )
+        
+        # Initialize image-to-video pipeline
+        self.pipe_image_to_video = LTXImageToVideoPipeline.from_pretrained(
+            "Lightricks/LTX-Video-0.9.7-dev",
             torch_dtype=torch.bfloat16,
         )
-        
+
         # Initialize upsampler pipeline
         self.pipe_upsample = LTXLatentUpsamplePipeline.from_pretrained(
             "Lightricks/ltxv-spatial-upscaler-0.9.7",
-            vae=self.pipe.vae,
+            vae=self.pipe_image_to_video.vae,
             torch_dtype=torch.bfloat16
         )
         
@@ -227,9 +239,10 @@ class LTX:
 
     @modal.enter(snap=False)
     def setup(self):
-        self.pipe.to("cuda")
+        # self.pipe.to("cuda")
         self.pipe_upsample.to("cuda")
-        self.pipe.vae.enable_tiling()
+        self.pipe_image_to_video.to("cuda")
+        self.pipe_image_to_video.vae.enable_tiling()
         
         self._load_mega_cache()
         self._optimize()
@@ -237,8 +250,8 @@ class LTX:
         self._save_mega_cache()
 
     def round_to_nearest_resolution_acceptable_by_vae(self, height, width):
-        height = height - (height % self.pipe.vae_temporal_compression_ratio)
-        width = width - (width % self.pipe.vae_temporal_compression_ratio)
+        height = height - (height % self.pipe_image_to_video.vae_temporal_compression_ratio)
+        width = width - (width % self.pipe_image_to_video.vae_temporal_compression_ratio)
         return height, width
 
     @modal.method()
@@ -317,6 +330,52 @@ class LTX:
         outputs.commit()
         return mp4_name
 
+    @modal.method()
+    def generate_from_image(
+        self,
+        image_bytes: bytes,
+        prompt: str,
+        negative_prompt="worst quality, inconsistent motion, blurry, jittery, distorted",
+        num_frames=25,
+        width=768,
+        height=512,
+        num_inference_steps=50,
+        guidance_scale=3.0,
+        seed: Optional[int] = None,
+    ):
+        from diffusers.utils import export_to_video, load_image
+        from PIL import Image
+        import torch
+        import random
+        
+        # Set seed for reproducibility
+        if seed is None:
+            seed = random.randint(0, 2**32 - 1)
+        print(f"Seeding RNG with: {seed}")
+        torch.manual_seed(seed)
+        
+        # Load image from bytes
+        image = load_image(Image.open(io.BytesIO(image_bytes)))
+        
+        # Generate video from image
+        video = self.pipe_image_to_video(
+            image=image,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            width=width,
+            height=height,
+            num_frames=num_frames,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+        ).frames[0]
+        
+        # Create filename with seed and prompt
+        mp4_name = f"{seed}_{''.join(c if c.isalnum() else '-' for c in prompt[:100])}.mp4"
+        export_to_video(video, Path(OUTPUTS_PATH) / mp4_name, fps=24)
+        outputs.commit()
+        torch.cuda.empty_cache()  # reduce fragmentation
+        return mp4_name
+
     @modal.fastapi_endpoint(method="POST", docs=True)
     def web(
         self,
@@ -357,6 +416,38 @@ class LTX:
             filename=mp4_name,
         )
 
+    @modal.fastapi_endpoint(method="POST", docs=True)
+    def web_image_to_video(
+        self,
+        image_bytes: Annotated[bytes, fastapi.File()],
+        prompt: str,
+        negative_prompt: Optional[str] = None,
+        num_frames: Optional[int] = None,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        num_inference_steps: Optional[int] = None,
+        guidance_scale: Optional[float] = None,
+        seed: Optional[int] = None,
+    ):
+        import fastapi
+        
+        mp4_name = self.generate_from_image.local(  # run in the same container
+            image_bytes=image_bytes,
+            prompt=prompt,
+            negative_prompt=negative_prompt or "worst quality, inconsistent motion, blurry, jittery, distorted",
+            num_frames=num_frames or 25,
+            width=width or 768,
+            height=height or 512,
+            num_inference_steps=num_inference_steps or 50,
+            guidance_scale=guidance_scale or 3.0,
+            seed=seed,
+        )
+        return fastapi.responses.FileResponse(
+            path=f"{Path(OUTPUTS_PATH) / mp4_name}",
+            media_type="video/mp4",
+            filename=mp4_name,
+        )
+
 
 # ## Generate videos from the command line
 
@@ -367,10 +458,16 @@ class LTX:
 # Then it will, by default, generate a second video to demonstrate
 # the lower latency when hitting a warm container.
 
-# You can trigger inference with:
+# You can trigger text-to-video inference with:
 
 # ```bash
-# modal run ltx
+# modal run ltx-optimized.py
+# ```
+
+# Or generate video from an image:
+
+# ```bash
+# modal run ltx-optimized.py --image-path /path/to/image.jpg --prompt "A cat looking out the window"
 # ```
 
 # All outputs are saved both locally and on a Modal Volume.
@@ -386,19 +483,26 @@ class LTX:
 # Optional command line flags for the script can be viewed with:
 
 # ```bash
-# modal run ltx --help
+# modal run ltx-optimized.py --help
 # ```
 
 # Using these flags, you can tweak your generation from the command line:
 
 # ```bash
-# modal run --detach ltx --prompt="a cat playing drums in a jazz ensemble" --num-inference-steps=64
+# modal run --detach ltx-optimized.py --prompt="a cat playing drums in a jazz ensemble"
+# ```
+
+# For image-to-video generation:
+
+# ```bash
+# modal run --detach ltx-optimized.py --image-path="https://example.com/image.jpg" --prompt="smooth camera movement"
 # ```
 
 
 @app.local_entrypoint()
 def main(
     prompt: Optional[str] = None,
+    image_path: Optional[str] = None,  # New parameter for image-to-video
     negative_prompt="worst quality, blurry, jittery, distorted",
     num_frames: int = 115,
     width: int = 1152,
@@ -411,17 +515,62 @@ def main(
     downscale_factor: float = 2/3,
     adain_factor: float = 1.0,
     denoise_strength: float = 0.999,
+    num_inference_steps: int = 50,  # For image-to-video
+    seed: Optional[int] = None,  # For image-to-video
     twice: bool = False,  # Changed default to False since we're doing multiple runs
 ):
-    # Define 10 creative prompts
+    ltx = LTX()
+
+    # Handle image-to-video generation
+    if image_path is not None:
+        import os
+        import urllib.request
+        
+        if prompt is None:
+            prompt = "A cinematic video sequence with smooth motion and high quality"
+        
+        print(f"🎥 Generating a video from the image at {image_path}")
+        print(f"🎥 using the prompt '{prompt}'")
+
+        # Load image bytes
+        if image_path.startswith(("http://", "https://")):
+            image_bytes = urllib.request.urlopen(image_path).read()
+        elif os.path.isfile(image_path):
+            image_bytes = Path(image_path).read_bytes()
+        else:
+            raise ValueError(f"{image_path} is not a valid file or URL.")
+
+        start = time.time()
+        mp4_name = ltx.generate_from_image.remote(
+            image_bytes=image_bytes,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            num_frames=num_frames,
+            width=width if width <= 768 else 768,  # Adjust for image-to-video defaults
+            height=height if height <= 512 else 512,  # Adjust for image-to-video defaults
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            seed=seed,
+        )
+        duration = time.time() - start
+        print(f"🎥 Generated video in {duration:.3f}s")
+        print(f"🎥 LTX video saved to Modal Volume at {mp4_name}")
+
+        local_dir = Path("/tmp/ltx")
+        local_dir.mkdir(exist_ok=True, parents=True)
+        local_path = local_dir / mp4_name
+        local_path.write_bytes(b"".join(outputs.read_file(mp4_name)))
+        print(f"🎥 LTX video saved locally at {local_path}")
+        return
+
+    # Handle text-to-video generation
+    # Define 2 creative prompts (reduced from 10 for brevity)
     prompts = [
         "A majestic eagle soaring through a sunset-lit canyon, wings spread wide against the orange sky",
         "A professional chef preparing sushi in a modern kitchen, with precise knife movements and artistic plating",
     ]
 
-    ltx = LTX()
-
-    def run(current_prompt):
+    def run_text_to_video(current_prompt):
         print(f"🎥 Generating a video from the prompt '{current_prompt}'")
         start = time.time()
         mp4_name = ltx.generate.remote(
@@ -452,15 +601,15 @@ def main(
 
     # If a specific prompt was provided via command line, use only that one
     if prompt is not None:
-        run(prompt)
+        run_text_to_video(prompt)
     else:
-        # Run all 10 predefined prompts
-        print("🎬 Starting generation of 10 different videos...")
+        # Run all predefined prompts
+        print("🎬 Starting generation of videos...")
         for i, current_prompt in enumerate(prompts, 1):
-            print(f"\n📽 Video {i}/10")
-            run(current_prompt)
+            print(f"\n📽 Video {i}/{len(prompts)}")
+            run_text_to_video(current_prompt)
             
-        print("✨ All 10 videos have been generated successfully!")
+        print("✨ All videos have been generated successfully!")
 
 
 # ## Addenda
