@@ -186,6 +186,7 @@ app = modal.App(name="wan21-fusion-x", image=image)
 
 @app.cls(
     min_containers=0,
+    max_containers=1, 
     gpu="A10G",
     volumes={"/cache": vol},
     timeout=3600,
@@ -205,22 +206,86 @@ class WanFusionX:
     # Restore ComfyUI server state. Re-enables the CUDA device for inference.
     @modal.enter(snap=False)
     def restore_snapshot(self):
+        import os
+        import torch
         import requests
+        import time
 
-        response = requests.post(f"http://127.0.0.1:{self.port}/cuda/set_device")
-        if response.status_code != 200:
-            print("Failed to set CUDA device")
+        # Ensure CUDA is visible and available
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+        
+        # Force torch to reinitialize CUDA context
+        if torch.cuda.is_available():
+            torch.cuda.init()
+            torch.cuda.empty_cache()
+            print(f"CUDA restored: {torch.cuda.device_count()} devices available")
+            print(f"Current device: {torch.cuda.current_device()}")
         else:
-            print("Successfully set CUDA device")
+            print("WARNING: CUDA not available after snapshot restoration")
+
+        # Wait a moment for the server to be ready
+        time.sleep(2)
+        
+        # Try to set CUDA device via API endpoint
+        try:
+            response = requests.post(f"http://127.0.0.1:{self.port}/cuda/set_device", timeout=10)
+            if response.status_code != 200:
+                print("Failed to set CUDA device via API")
+            else:
+                print("Successfully set CUDA device via API")
+        except Exception as e:
+            print(f"Error setting CUDA device via API: {e}")
 
     @modal.method()
     def infer(self, workflow_path: str = "/root/WanFusionXAPI.json"):
-        # sometimes the ComfyUI server stops responding (we think because of memory leaks), so this makes sure it's still up
+        import os
+        import torch
+        
+        # Wait for ComfyUI server to be ready and healthy before proceeding
         self.poll_server_health()
+        
+        # Verify CUDA is available before running inference
+        self.verify_cuda_available()
 
-        # runs the comfy run --workflow command as a subprocess
-        cmd = f"comfy run --workflow {workflow_path} --wait --timeout 1200 --verbose"
-        subprocess.run(cmd, shell=True, check=True)
+        # Ensure CUDA environment is properly set for the subprocess
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = "0"
+        env["TORCH_CUDA_ARCH_LIST"] = "8.6"  # For A10G GPU
+        
+        # Force CUDA initialization in current process to ensure it's available
+        if torch.cuda.is_available():
+            torch.cuda.init()
+            torch.cuda.empty_cache()
+
+        # Create a wrapper script that initializes CUDA before running the workflow
+        wrapper_script = f"""#!/bin/bash
+export CUDA_VISIBLE_DEVICES=0
+export TORCH_CUDA_ARCH_LIST=8.6
+
+# Initialize CUDA in Python before running workflow
+python3 -c "
+import os
+import torch
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+if torch.cuda.is_available():
+    torch.cuda.init()
+    torch.cuda.empty_cache()
+    print('CUDA initialized for workflow execution')
+else:
+    print('WARNING: CUDA not available for workflow execution')
+"
+
+# Run the actual workflow
+comfy run --workflow {workflow_path} --wait --timeout 1200 --verbose
+"""
+        
+        # Write and execute the wrapper script
+        wrapper_path = "/tmp/run_workflow_with_cuda.sh"
+        with open(wrapper_path, "w") as f:
+            f.write(wrapper_script)
+        
+        os.chmod(wrapper_path, 0o755)
+        subprocess.run(wrapper_path, shell=True, check=True, env=env)
 
         # completed workflows write output images to this directory
         output_dir = "/root/comfy/ComfyUI/output"
@@ -286,19 +351,71 @@ class WanFusionX:
     def poll_server_health(self) -> Dict:
         import socket
         import urllib
+        import time
 
-        try:
-            # check if the server is up (response should be immediate)
-            req = urllib.request.Request(f"http://127.0.0.1:{self.port}/system_stats")
-            urllib.request.urlopen(req, timeout=5)
-            print("ComfyUI server is healthy")
-        except (socket.timeout, urllib.error.URLError) as e:
-            # if no response in 5 seconds, stop the container
-            print(f"Server health check failed: {str(e)}")
-            modal.experimental.stop_fetching_inputs()
+        max_retries = 30  # Wait up to 60 seconds for server to be ready
+        retry_delay = 2  # Wait 2 second between retries
+        
+        for attempt in range(max_retries):
+            try:
+                # check if the server is up (response should be immediate)
+                req = urllib.request.Request(f"http://127.0.0.1:{self.port}/system_stats")
+                response = urllib.request.urlopen(req, timeout=5)
+                
+                # Check if we got a successful response
+                if response.getcode() == 200:
+                    print("ComfyUI server is healthy")
+                    return
+                else:
+                    print(f"Server returned status code: {response.getcode()}")
+                    
+            except urllib.error.HTTPError as e:
+                if e.code == 500:
+                    print(f"Server starting up (attempt {attempt + 1}/{max_retries})...")
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    print(f"HTTP Error {e.code}: {e.reason}")
+                    
+            except (socket.timeout, urllib.error.URLError) as e:
+                print(f"Connection attempt {attempt + 1}/{max_retries} failed: {str(e)}")
+                
+            # Wait before retrying unless this is the last attempt
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+        
+        # If we've exhausted all retries, stop the container
+        print(f"Server health check failed after {max_retries} attempts, stopping container")
+        modal.experimental.stop_fetching_inputs()
+        raise Exception("ComfyUI server is not healthy, stopping container")
 
-            # all queued inputs will be marked "Failed", so you need to catch these errors in your client and then retry
-            raise Exception("ComfyUI server is not healthy, stopping container")
+    def verify_cuda_available(self):
+        """Verify CUDA is available and working before inference"""
+        import torch
+        import time
+        
+        max_retries = 10
+        retry_delay = 1
+        
+        for attempt in range(max_retries):
+            try:
+                if torch.cuda.is_available():
+                    # Try to allocate a small tensor to verify CUDA is working
+                    test_tensor = torch.tensor([1.0]).cuda()
+                    del test_tensor
+                    torch.cuda.empty_cache()
+                    print("CUDA verification successful")
+                    return
+                else:
+                    print(f"CUDA not available (attempt {attempt + 1}/{max_retries})")
+                    
+            except Exception as e:
+                print(f"CUDA verification failed (attempt {attempt + 1}/{max_retries}): {e}")
+                
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+        
+        raise Exception("CUDA is not available or not working properly")
 
     @modal.web_server(port, startup_timeout=60)
     def ui(self):
