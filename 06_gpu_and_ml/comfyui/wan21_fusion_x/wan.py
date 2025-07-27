@@ -174,23 +174,22 @@ image = (
     )
 )
 
-# Lastly, copy the ComfyUI workflow JSON to the container.
-image = image.add_local_file(
-    Path(__file__).parent / "wan_workflow_api.json", "/root/workflow_api.json"
-)
 
 # Add the WanFusionX API workflow
 image = image.add_local_file(
-    Path(__file__).parent / "WanFusionXAPI.json", "/root/WanFusionXAPI.json"
+    Path(__file__).parent / "WanFusionXAPI.json", "/root/WanFusionXAPI.json",
+    copy=True
 )
 
 app = modal.App(name="wan21-fusion-x", image=image)
 
 
 @app.cls(
-    max_containers=1,
+    min_containers=0,
     gpu="A10G",
     volumes={"/cache": vol},
+    timeout=3600,
+    scaledown_window=30,  # 5 minutes
     enable_memory_snapshot=True,  # snapshot container state for faster cold starts
 )
 @modal.concurrent(max_inputs=10)
@@ -246,6 +245,7 @@ class WanFusionX:
     def process_image_bytes(self, image: bytes, prompt: str = None):
         """Process image bytes and return generated video bytes"""
         # Save uploaded image to ComfyUI input directory
+        print ("Sending image to process")
         client_id = uuid.uuid4().hex
         image_filename = f"input_{client_id}.png"
         input_dir = Path("/root/comfy/ComfyUI/input")
@@ -253,6 +253,7 @@ class WanFusionX:
         
         image_path = input_dir / image_filename
         image_path.write_bytes(image)
+        print (image_path)
 
         # Load the workflow template
         workflow_data = json.loads(Path("/root/WanFusionXAPI.json").read_text())
@@ -280,13 +281,7 @@ class WanFusionX:
 
         return video_bytes
 
-    @modal.fastapi_endpoint(method="POST", label="image-to-video")
-    def image_to_video(self, image: bytes, prompt: str = "The boys eyes glow and colored musical notes can be seen in the reflection."):
-        from fastapi import Response
 
-        # Process the image using the local method
-        video_bytes = self.process_image_bytes.local(image, prompt)
-        return Response(video_bytes, media_type="video/mp4")
 
     def poll_server_health(self) -> Dict:
         import socket
@@ -310,3 +305,54 @@ class WanFusionX:
         subprocess.Popen(
             f"comfy launch -- --listen 0.0.0.0 --port {self.port}", shell=True
         )
+
+# Create a separate FastAPI app for file uploads
+@app.function(
+    image=image.pip_install("python-multipart"),
+    volumes={"/cache": vol},
+    min_containers=0,
+    scaledown_window=60 * 5,
+    timeout=60 * 60,
+    # gradio requires sticky sessions
+    # so we limit the number of concurrent containers to 1
+    # and allow it to scale to 100 concurrent inputs
+    max_containers=1,
+)
+@modal.concurrent(max_inputs=1000)
+@modal.asgi_app()
+def fastapi_app():
+    from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+    from fastapi.responses import Response
+    from typing import Optional
+
+    web_app = FastAPI(title="WanFusionX Image-to-Video API", docs_url="/docs")
+
+    @web_app.post("/image-to-video")
+    async def image_to_video(
+        image: UploadFile = File(...),
+        prompt: Optional[str] = Form("The boys eyes glow and colored musical notes can be seen in the reflection.")
+    ):
+        """Upload an image file and get back a generated video"""
+        
+        # Validate file type
+        if not image.content_type or not image.content_type.startswith('image/'):
+            raise HTTPException(status_code=400, detail="File must be an image")
+        
+        # Read image content
+        image_content = await image.read()
+        
+        # Call the WanFusionX using the remote method
+        wan_fusion = WanFusionX()
+        result_bytes = wan_fusion.process_image_bytes.remote(image_content, prompt)
+        
+        return Response(
+            content=result_bytes,
+            media_type="video/mp4",
+            headers={"Content-Disposition": f"attachment; filename=generated_{image.filename}.mp4"}
+        )
+
+    @web_app.get("/")
+    def root():
+        return {"message": "WanFusionX Image-to-Video API - Use POST /image-to-video to upload images and generate videos"}
+
+    return web_app

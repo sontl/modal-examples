@@ -1,13 +1,15 @@
-# Video Upscaler with Modal and ComfyUI
+# WanFusionX: Image-to-Video and Video Upscaling with Modal and ComfyUI
 
-This project provides a video upscaling service using ComfyUI's WAN2.1 model deployed on Modal.com.
+This project provides both image-to-video generation and video upscaling services using ComfyUI's WAN2.1 models deployed on Modal.com.
 
 ## Features
 
-- Video upscaling using RealESRGAN and WAN2.1 models
-- FastAPI endpoint for easy video upload
+- **Image-to-Video Generation**: Convert static images to animated videos using WanFusionX
+- **Video Upscaling**: Enhance video quality using RealESRGAN and WAN2.1 models
+- FastAPI endpoints for easy file upload
 - Memory snapshots for faster cold starts
 - Automatic model downloading from Hugging Face
+- Customizable prompts for image-to-video generation
 
 ## Setup
 
@@ -17,12 +19,76 @@ pip install modal
 modal setup
 ```
 
-2. Deploy the application:
+2. Deploy the applications:
+
+**For Image-to-Video Generation:**
+```bash
+modal deploy wan.py
+```
+
+**For Video Upscaling:**
 ```bash
 modal deploy upscaler-wan.py
 ```
 
 ## Usage
+
+## Image-to-Video Generation
+
+### Method 1: FastAPI Endpoint
+
+After deploying `wan.py`, Modal will provide you with URLs like:
+- FastAPI app: `https://your-workspace--wan21-fusion-x-fastapi-app.modal.run`
+- Image-to-Video endpoint: `https://your-workspace--wan21-fusion-x-fastapi-app.modal.run/image-to-video`
+- API docs: `https://your-workspace--wan21-fusion-x-fastapi-app.modal.run/docs`
+- ComfyUI interface: `https://your-workspace--wan-fusion-x-ui.modal.run`
+
+**Upload an image and generate video:**
+
+```bash
+curl -X POST \
+  -F "image=@your_image.jpg" \
+  -F "prompt=A beautiful sunset with moving clouds and gentle waves" \
+  https://your-workspace--wan21-fusion-x-fastapi-app.modal.run/image-to-video \
+  -o generated_video.mp4
+```
+
+### Method 2: Python Script
+
+Use the provided test script:
+
+```bash
+python test_image_to_video.py
+```
+
+### Method 3: Web Interface
+
+Open `image_to_video_interface.html` in your browser for a user-friendly interface to upload images and generate videos.
+
+### Method 4: Direct API Call
+
+```python
+import modal
+
+# Get the deployed class
+wan_cls = modal.Cls.from_name("wan21-fusion-x", "WanFusionX")
+
+# Read your image file
+with open("input_image.jpg", "rb") as f:
+    image_bytes = f.read()
+
+# Generate video
+result = wan_cls().process_image_bytes.remote(
+    image_bytes, 
+    prompt="Your custom prompt here"
+)
+
+# Save the result
+with open("generated_video.mp4", "wb") as f:
+    f.write(result)
+```
+
+## Video Upscaling
 
 ### Method 1: FastAPI Web Interface
 
@@ -89,6 +155,33 @@ with open("upscaled_video.mp4", "wb") as f:
 ```
 
 ## API Endpoints
+
+### POST /image-to-video
+Convert an image to an animated video.
+
+**Request:**
+- Method: POST
+- Content-Type: multipart/form-data
+- Body: 
+  - `image` (required): Image file (JPG, PNG, etc.)
+  - `prompt` (optional): Text description of desired animation
+
+**Response:**
+- Content-Type: video/mp4
+- Body: Generated video file
+
+**Example:**
+```python
+import requests
+
+with open("input.jpg", "rb") as f:
+    files = {"image": ("input.jpg", f, "image/jpeg")}
+    data = {"prompt": "The person's eyes glow with magical energy"}
+    response = requests.post("https://your-endpoint/image-to-video", files=files, data=data)
+    
+with open("output.mp4", "wb") as f:
+    f.write(response.content)
+```
 
 ### POST /upscale
 Upload a video file for upscaling.
