@@ -5,8 +5,11 @@
 
 # Image building and model downloading is directly taken from the core example: https://modal.com/docs/examples/comfyapp
 # The notable changes are copying the custom node in the image and the cls object
+import json
 import subprocess
+import uuid
 from pathlib import Path
+from typing import Dict
 
 import modal
 
@@ -126,12 +129,12 @@ def hf_download():
 
     lora_model = hf_hub_download(
         repo_id="Kijai/WanVideo_comfy",
-        filename="Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank32.safetensors",
+        filename="Lightx2v/lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank32_bf16.safetensors",
         cache_dir="/cache",
     )
 
     subprocess.run(
-        f"ln -s {lora_model} /root/comfy/ComfyUI/models/loras/Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank32.safetensors",
+        f"ln -s {lora_model} /root/comfy/ComfyUI/models/loras/lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank32_bf16.safetensors",
         shell=True,
         check=True,
     )
@@ -176,6 +179,11 @@ image = image.add_local_file(
     Path(__file__).parent / "wan_workflow_api.json", "/root/workflow_api.json"
 )
 
+# Add the WanFusionX API workflow
+image = image.add_local_file(
+    Path(__file__).parent / "WanFusionXAPI.json", "/root/WanFusionXAPI.json"
+)
+
 app = modal.App(name="wan21-fusion-x", image=image)
 
 
@@ -205,6 +213,97 @@ class WanFusionX:
             print("Failed to set CUDA device")
         else:
             print("Successfully set CUDA device")
+
+    @modal.method()
+    def infer(self, workflow_path: str = "/root/WanFusionXAPI.json"):
+        # sometimes the ComfyUI server stops responding (we think because of memory leaks), so this makes sure it's still up
+        self.poll_server_health()
+
+        # runs the comfy run --workflow command as a subprocess
+        cmd = f"comfy run --workflow {workflow_path} --wait --timeout 1200 --verbose"
+        subprocess.run(cmd, shell=True, check=True)
+
+        # completed workflows write output images to this directory
+        output_dir = "/root/comfy/ComfyUI/output"
+
+        # looks up the name of the output image file based on the workflow
+        workflow = json.loads(Path(workflow_path).read_text())
+        file_prefix = [
+            node.get("inputs")
+            for node in workflow.values()
+            if node.get("class_type") == "VHS_VideoCombine"
+        ][0]["filename_prefix"]
+
+        # returns the video as bytes
+        for f in Path(output_dir).iterdir():
+            if f.name.startswith(file_prefix) and f.suffix in ['.mp4', '.avi', '.mov']:
+                return f.read_bytes()
+        
+        # If no video file found, raise an error
+        raise FileNotFoundError(f"No video output found with prefix: {file_prefix}")
+
+    @modal.method()
+    def process_image_bytes(self, image: bytes, prompt: str = None):
+        """Process image bytes and return generated video bytes"""
+        # Save uploaded image to ComfyUI input directory
+        client_id = uuid.uuid4().hex
+        image_filename = f"input_{client_id}.png"
+        input_dir = Path("/root/comfy/ComfyUI/input")
+        input_dir.mkdir(exist_ok=True)
+        
+        image_path = input_dir / image_filename
+        image_path.write_bytes(image)
+
+        # Load the workflow template
+        workflow_data = json.loads(Path("/root/WanFusionXAPI.json").read_text())
+
+        # Update the image input
+        workflow_data["52"]["inputs"]["image"] = image_filename
+
+        # Update the prompt if provided
+        if prompt:
+            workflow_data["6"]["inputs"]["text"] = prompt
+
+        # Give the output video a unique id per client request
+        workflow_data["30"]["inputs"]["filename_prefix"] = f"FusionXi2v/FusionX_{client_id}"
+
+        # Save this updated workflow to a new file
+        new_workflow_file = f"/tmp/{client_id}.json"
+        with open(new_workflow_file, "w") as f:
+            json.dump(workflow_data, f)
+
+        # Run inference on the currently running container
+        video_bytes = self.infer.local(new_workflow_file)
+
+        # Clean up input file
+        image_path.unlink(missing_ok=True)
+
+        return video_bytes
+
+    @modal.fastapi_endpoint(method="POST", label="image-to-video")
+    def image_to_video(self, image: bytes, prompt: str = "The boys eyes glow and colored musical notes can be seen in the reflection."):
+        from fastapi import Response
+
+        # Process the image using the local method
+        video_bytes = self.process_image_bytes.local(image, prompt)
+        return Response(video_bytes, media_type="video/mp4")
+
+    def poll_server_health(self) -> Dict:
+        import socket
+        import urllib
+
+        try:
+            # check if the server is up (response should be immediate)
+            req = urllib.request.Request(f"http://127.0.0.1:{self.port}/system_stats")
+            urllib.request.urlopen(req, timeout=5)
+            print("ComfyUI server is healthy")
+        except (socket.timeout, urllib.error.URLError) as e:
+            # if no response in 5 seconds, stop the container
+            print(f"Server health check failed: {str(e)}")
+            modal.experimental.stop_fetching_inputs()
+
+            # all queued inputs will be marked "Failed", so you need to catch these errors in your client and then retry
+            raise Exception("ComfyUI server is not healthy, stopping container")
 
     @modal.web_server(port, startup_timeout=60)
     def ui(self):
