@@ -37,9 +37,6 @@ image = (
     .run_commands(  # download the ComfyUI Essentials custom node pack
         "comfy node registry-install comfyui-logicutils"
     )
-    .run_commands(  # download the ComfyUI Essentials custom node pack
-        "comfy node registry-install comfyui-multigpu"
-    )
     .run_commands(
         "comfy --skip-prompt model download --url  https://huggingface.co/vrgamedevgirl84/Wan14BT2VFusioniX/resolve/main/OtherLoRa%27s/Wan14B_RealismBoost.safetensors?download=true --relative-path models/loras",
     ).run_commands(
@@ -177,9 +174,10 @@ image = (
 
 # Add the WanFusionX API workflow
 image = image.add_local_file(
-    Path(__file__).parent / "WanFusionXAPI.json", "/root/WanFusionXAPI.json",
+    Path(__file__).parent / "wan-fusion-x-api.json", "/root/wan-fusion-x-api.json",
     copy=True
 )
+
 
 app = modal.App(name="wan21-fusion-x", image=image)
 
@@ -237,9 +235,11 @@ class WanFusionX:
             print(f"Error setting CUDA device via API: {e}")
 
     @modal.method()
-    def infer(self, workflow_path: str = "/root/WanFusionXAPI.json"):
+    def infer(self, workflow_path: str = "/root/wan-fusion-x-api.json"):
         import os
         import torch
+        
+        print(f"Starting inference with workflow: {workflow_path}")
         
         # Wait for ComfyUI server to be ready and healthy before proceeding
         self.poll_server_health()
@@ -256,61 +256,113 @@ class WanFusionX:
         if torch.cuda.is_available():
             torch.cuda.init()
             torch.cuda.empty_cache()
+            print("CUDA initialized successfully")
 
-        # Create a wrapper script that initializes CUDA before running the workflow
-        wrapper_script = f"""#!/bin/bash
-export CUDA_VISIBLE_DEVICES=0
-export TORCH_CUDA_ARCH_LIST=8.6
-
-# Initialize CUDA in Python before running workflow
-python3 -c "
-import os
-import torch
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-if torch.cuda.is_available():
-    torch.cuda.init()
-    torch.cuda.empty_cache()
-    print('CUDA initialized for workflow execution')
-else:
-    print('WARNING: CUDA not available for workflow execution')
-"
-
-# Run the actual workflow
-comfy run --workflow {workflow_path} --wait --timeout 1200 --verbose
-"""
+        # Verify the workflow file exists and is valid
+        if not Path(workflow_path).exists():
+            raise FileNotFoundError(f"Workflow file not found: {workflow_path}")
         
-        # Write and execute the wrapper script
-        wrapper_path = "/tmp/run_workflow_with_cuda.sh"
-        with open(wrapper_path, "w") as f:
-            f.write(wrapper_script)
+        # Load and validate workflow
+        try:
+            workflow = json.loads(Path(workflow_path).read_text())
+            print("Workflow loaded successfully")
+            
+            # Check if the image file exists
+            image_filename = workflow.get("52", {}).get("inputs", {}).get("image")
+            if image_filename:
+                image_path = Path(f"/root/comfy/ComfyUI/input/{image_filename}")
+                if not image_path.exists():
+                    raise FileNotFoundError(f"Input image not found: {image_path}")
+                print(f"Input image verified: {image_path}")
+            
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid workflow JSON: {e}")
+
+        # Run the comfy workflow command with better error handling
+        cmd = f"comfy run --workflow {workflow_path} --wait --timeout 1800 --verbose"
+        print(f"Executing command: {cmd}")
         
-        os.chmod(wrapper_path, 0o755)
-        subprocess.run(wrapper_path, shell=True, check=True, env=env)
+        try:
+            result = subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True, env=env)
+            print("Workflow execution completed successfully")
+            if result.stdout:
+                print(f"STDOUT: {result.stdout}")
+            if result.stderr:
+                print(f"STDERR: {result.stderr}")
+        except subprocess.CalledProcessError as e:
+            print(f"Workflow execution failed with return code {e.returncode}")
+            print(f"STDOUT: {e.stdout}")
+            print(f"STDERR: {e.stderr}")
+            raise RuntimeError(f"ComfyUI workflow execution failed: {e.stderr}")
 
         # completed workflows write output images to this directory
         output_dir = "/root/comfy/ComfyUI/output"
+        print(f"Looking for output in: {output_dir}")
 
         # looks up the name of the output image file based on the workflow
-        workflow = json.loads(Path(workflow_path).read_text())
         file_prefix = [
             node.get("inputs")
             for node in workflow.values()
             if node.get("class_type") == "VHS_VideoCombine"
         ][0]["filename_prefix"]
-
-        # returns the video as bytes
-        for f in Path(output_dir).iterdir():
-            if f.name.startswith(file_prefix) and f.suffix in ['.mp4', '.avi', '.mov']:
-                return f.read_bytes()
         
-        # If no video file found, raise an error
-        raise FileNotFoundError(f"No video output found with prefix: {file_prefix}")
+        print(f"Looking for files with prefix: {file_prefix}")
+
+        # List all files in output directory for debugging
+        if Path(output_dir).exists():
+            all_files = list(Path(output_dir).iterdir())
+            print(f"All files in output directory: {[f.name for f in all_files]}")
+            
+            # Also check subdirectories
+            for item in Path(output_dir).iterdir():
+                if item.is_dir():
+                    subdir_files = list(item.iterdir())
+                    print(f"Files in subdirectory {item.name}: {[f.name for f in subdir_files]}")
+        else:
+            print(f"Output directory does not exist: {output_dir}")
+            raise FileNotFoundError(f"Output directory not found: {output_dir}")
+
+        # Function to recursively search for video files
+        def find_video_files(directory, prefix):
+            video_files = []
+            for item in Path(directory).rglob("*"):
+                if item.is_file() and item.suffix in ['.mp4', '.avi', '.mov']:
+                    # Check if the file matches the prefix pattern
+                    # The prefix might include subdirectory, so we need to check the relative path
+                    relative_path = item.relative_to(Path(output_dir))
+                    relative_path_str = str(relative_path).replace('\\', '/')  # Normalize path separators
+                    
+                    # Extract just the filename part of the prefix for comparison
+                    prefix_filename = prefix.split('/')[-1] if '/' in prefix else prefix
+                    
+                    if item.name.startswith(prefix_filename):
+                        video_files.append(item)
+                        print(f"Found matching video file: {relative_path_str}")
+            return video_files
+
+        # Search for video files recursively
+        video_files = find_video_files(output_dir, file_prefix)
+        
+        if video_files:
+            # Return the first matching video file
+            video_file = video_files[0]
+            print(f"Using video file: {video_file}")
+            return video_file.read_bytes()
+        
+        # If no video file found, raise an error with more detailed information
+        all_files_recursive = []
+        for item in Path(output_dir).rglob("*"):
+            if item.is_file():
+                relative_path = item.relative_to(Path(output_dir))
+                all_files_recursive.append(str(relative_path))
+        
+        raise FileNotFoundError(f"No video output found with prefix: {file_prefix}. All files found recursively: {all_files_recursive}")
 
     @modal.method()
     def process_image_bytes(self, image: bytes, prompt: str = None):
         """Process image bytes and return generated video bytes"""
         # Save uploaded image to ComfyUI input directory
-        print ("Sending image to process")
+        print("Sending image to process")
         client_id = uuid.uuid4().hex
         image_filename = f"input_{client_id}.png"
         input_dir = Path("/root/comfy/ComfyUI/input")
@@ -318,17 +370,25 @@ comfy run --workflow {workflow_path} --wait --timeout 1200 --verbose
         
         image_path = input_dir / image_filename
         image_path.write_bytes(image)
-        print (image_path)
+        print(f"Image saved to: {image_path}")
+        
+        # Verify image was saved correctly
+        if not image_path.exists():
+            raise FileNotFoundError(f"Failed to save image to {image_path}")
+        
+        print(f"Image file size: {image_path.stat().st_size} bytes")
 
         # Load the workflow template
-        workflow_data = json.loads(Path("/root/WanFusionXAPI.json").read_text())
+        workflow_data = json.loads(Path("/root/wan-fusion-x-api.json").read_text())
 
         # Update the image input
         workflow_data["52"]["inputs"]["image"] = image_filename
+        print(f"Updated workflow to use image: {image_filename}")
 
         # Update the prompt if provided
         if prompt:
             workflow_data["6"]["inputs"]["text"] = prompt
+            print(f"Updated prompt to: {prompt}")
 
         # Give the output video a unique id per client request
         workflow_data["30"]["inputs"]["filename_prefix"] = f"FusionXi2v/FusionX_{client_id}"
@@ -336,13 +396,23 @@ comfy run --workflow {workflow_path} --wait --timeout 1200 --verbose
         # Save this updated workflow to a new file
         new_workflow_file = f"/tmp/{client_id}.json"
         with open(new_workflow_file, "w") as f:
-            json.dump(workflow_data, f)
+            json.dump(workflow_data, f, indent=2)
+        
+        print(f"Workflow saved to: {new_workflow_file}")
 
         # Run inference on the currently running container
-        video_bytes = self.infer.local(new_workflow_file)
+        try:
+            video_bytes = self.infer.local(new_workflow_file)
+        except Exception as e:
+            print(f"Inference failed: {e}")
+            # Clean up files before re-raising
+            image_path.unlink(missing_ok=True)
+            Path(new_workflow_file).unlink(missing_ok=True)
+            raise
 
         # Clean up input file
         image_path.unlink(missing_ok=True)
+        Path(new_workflow_file).unlink(missing_ok=True)
 
         return video_bytes
 
@@ -352,6 +422,7 @@ comfy run --workflow {workflow_path} --wait --timeout 1200 --verbose
         import socket
         import urllib
         import time
+        import json
 
         max_retries = 30  # Wait up to 60 seconds for server to be ready
         retry_delay = 2  # Wait 2 second between retries
@@ -365,6 +436,17 @@ comfy run --workflow {workflow_path} --wait --timeout 1200 --verbose
                 # Check if we got a successful response
                 if response.getcode() == 200:
                     print("ComfyUI server is healthy")
+                    
+                    # Also check the queue status
+                    try:
+                        queue_req = urllib.request.Request(f"http://127.0.0.1:{self.port}/queue")
+                        queue_response = urllib.request.urlopen(queue_req, timeout=5)
+                        if queue_response.getcode() == 200:
+                            queue_data = json.loads(queue_response.read().decode())
+                            print(f"Queue status - Running: {len(queue_data.get('queue_running', []))}, Pending: {len(queue_data.get('queue_pending', []))}")
+                    except Exception as e:
+                        print(f"Could not check queue status: {e}")
+                    
                     return
                 else:
                     print(f"Server returned status code: {response.getcode()}")
@@ -416,6 +498,46 @@ comfy run --workflow {workflow_path} --wait --timeout 1200 --verbose
                 time.sleep(retry_delay)
         
         raise Exception("CUDA is not available or not working properly")
+
+    def check_workflow_progress(self, timeout_seconds=300):
+        """Monitor workflow progress via ComfyUI API"""
+        import urllib.request
+        import json
+        import time
+        
+        start_time = time.time()
+        last_queue_size = None
+        
+        while time.time() - start_time < timeout_seconds:
+            try:
+                # Check queue status
+                queue_req = urllib.request.Request(f"http://127.0.0.1:{self.port}/queue")
+                queue_response = urllib.request.urlopen(queue_req, timeout=5)
+                
+                if queue_response.getcode() == 200:
+                    queue_data = json.loads(queue_response.read().decode())
+                    running = len(queue_data.get('queue_running', []))
+                    pending = len(queue_data.get('queue_pending', []))
+                    
+                    current_queue_size = running + pending
+                    
+                    if current_queue_size == 0:
+                        print("Workflow completed - queue is empty")
+                        return True
+                    
+                    if last_queue_size is not None and current_queue_size != last_queue_size:
+                        print(f"Queue progress - Running: {running}, Pending: {pending}")
+                    
+                    last_queue_size = current_queue_size
+                    
+                time.sleep(5)  # Check every 5 seconds
+                
+            except Exception as e:
+                print(f"Error checking workflow progress: {e}")
+                time.sleep(5)
+        
+        print(f"Workflow progress check timed out after {timeout_seconds} seconds")
+        return False
 
     @modal.web_server(port, startup_timeout=60)
     def ui(self):
