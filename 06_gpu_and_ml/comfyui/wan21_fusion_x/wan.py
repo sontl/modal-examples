@@ -187,7 +187,7 @@ app = modal.App(name="wan21-fusion-x", image=image)
     max_containers=1, 
     gpu="A10G",
     volumes={"/cache": vol},
-    timeout=3600,
+    timeout=60*10,
     scaledown_window=30,  # 5 minutes
     enable_memory_snapshot=True,  # snapshot container state for faster cold starts
 )
@@ -238,6 +238,7 @@ class WanFusionX:
     def infer(self, workflow_path: str = "/root/wan-fusion-x-api.json"):
         import os
         import torch
+        import json
         
         print(f"Starting inference with workflow: {workflow_path}")
         
@@ -289,6 +290,17 @@ class WanFusionX:
                 print(f"STDOUT: {result.stdout}")
             if result.stderr:
                 print(f"STDERR: {result.stderr}")
+                
+            # Wait a moment for file system to sync
+            import time
+            time.sleep(2)
+            
+            # Get workflow history for debugging (optional)
+            try:
+                self.get_workflow_history()
+            except Exception as e:
+                print(f"Could not get workflow history: {e}")
+            
         except subprocess.CalledProcessError as e:
             print(f"Workflow execution failed with return code {e.returncode}")
             print(f"STDOUT: {e.stdout}")
@@ -298,46 +310,51 @@ class WanFusionX:
         # completed workflows write output images to this directory
         output_dir = "/root/comfy/ComfyUI/output"
         print(f"Looking for output in: {output_dir}")
+        
+
 
         # looks up the name of the output image file based on the workflow
-        file_prefix = [
+        vhs_nodes = [
             node.get("inputs")
             for node in workflow.values()
             if node.get("class_type") == "VHS_VideoCombine"
-        ][0]["filename_prefix"]
+        ]
+        
+        if not vhs_nodes:
+            raise ValueError("No VHS_VideoCombine node found in workflow")
+            
+        file_prefix = vhs_nodes[0]["filename_prefix"]
         
         print(f"Looking for files with prefix: {file_prefix}")
+        print(f"VHS_VideoCombine node settings: {vhs_nodes[0]}")
 
-        # List all files in output directory for debugging
-        if Path(output_dir).exists():
-            all_files = list(Path(output_dir).iterdir())
-            print(f"All files in output directory: {[f.name for f in all_files]}")
-            
-            # Also check subdirectories
-            for item in Path(output_dir).iterdir():
-                if item.is_dir():
-                    subdir_files = list(item.iterdir())
-                    print(f"Files in subdirectory {item.name}: {[f.name for f in subdir_files]}")
-        else:
+        # Check if output directory exists
+        if not Path(output_dir).exists():
             print(f"Output directory does not exist: {output_dir}")
             raise FileNotFoundError(f"Output directory not found: {output_dir}")
+            
+
 
         # Function to recursively search for video files
         def find_video_files(directory, prefix):
             video_files = []
             for item in Path(directory).rglob("*"):
-                if item.is_file() and item.suffix in ['.mp4', '.avi', '.mov']:
+                if item.is_file() and item.suffix in ['.mp4', '.avi', '.mov', '.webm']:
                     # Check if the file matches the prefix pattern
                     # The prefix might include subdirectory, so we need to check the relative path
                     relative_path = item.relative_to(Path(output_dir))
                     relative_path_str = str(relative_path).replace('\\', '/')  # Normalize path separators
                     
-                    # Extract just the filename part of the prefix for comparison
-                    prefix_filename = prefix.split('/')[-1] if '/' in prefix else prefix
-                    
-                    if item.name.startswith(prefix_filename):
+                    # Check if the relative path starts with the prefix (handles subdirectories)
+                    if relative_path_str.startswith(prefix):
                         video_files.append(item)
                         print(f"Found matching video file: {relative_path_str}")
+                    else:
+                        # Also check if just the filename matches (fallback)
+                        prefix_filename = prefix.split('/')[-1] if '/' in prefix else prefix
+                        if item.name.startswith(prefix_filename):
+                            video_files.append(item)
+                            print(f"Found matching video file (filename match): {relative_path_str}")
             return video_files
 
         # Search for video files recursively
@@ -349,7 +366,33 @@ class WanFusionX:
             print(f"Using video file: {video_file}")
             return video_file.read_bytes()
         
-        # If no video file found, raise an error with more detailed information
+        # If no exact match found, look for any video files that might have been created recently in output directory
+        print("No exact prefix match found, searching for recent video files in output directory...")
+        import time
+        current_time = time.time()
+        recent_threshold = 300  # 5 minutes
+        
+        all_video_files = []
+        for item in Path(output_dir).rglob("*"):
+            if item.is_file() and item.suffix in ['.mp4', '.avi', '.mov', '.webm']:
+                mtime = item.stat().st_mtime
+                if current_time - mtime < recent_threshold:  # File created in last 5 minutes
+                    relative_path = item.relative_to(Path(output_dir))
+                    all_video_files.append((str(item), mtime, item.stat().st_size))
+                    print(f"Found recent video file: {relative_path} (size: {item.stat().st_size} bytes)")
+        
+        # Sort by modification time (most recent first)
+        all_video_files.sort(key=lambda x: x[1], reverse=True)
+        
+        if all_video_files:
+            print(f"Found {len(all_video_files)} recent video files, using most recent: {Path(all_video_files[0][0]).name}")
+            most_recent_video = Path(all_video_files[0][0])
+            if most_recent_video.exists() and most_recent_video.stat().st_size > 0:
+                return most_recent_video.read_bytes()
+            else:
+                print(f"Most recent video file is empty or doesn't exist: {most_recent_video}")
+        
+        # If no video file found at all, raise an error with more detailed information
         all_files_recursive = []
         for item in Path(output_dir).rglob("*"):
             if item.is_file():
@@ -499,6 +542,33 @@ class WanFusionX:
         
         raise Exception("CUDA is not available or not working properly")
 
+    def get_workflow_history(self):
+        """Get recent workflow execution history from ComfyUI API"""
+        import urllib.request
+        import json
+        
+        try:
+            history_req = urllib.request.Request(f"http://127.0.0.1:{self.port}/history")
+            history_response = urllib.request.urlopen(history_req, timeout=10)
+            
+            if history_response.getcode() == 200:
+                history_data = json.loads(history_response.read().decode())
+                print(f"Retrieved workflow history with {len(history_data)} entries")
+                
+                # Look for recent completed workflows
+                for workflow_id, workflow_info in list(history_data.items())[:5]:  # Check last 5 workflows
+                    if 'outputs' in workflow_info:
+                        print(f"Workflow {workflow_id} outputs: {workflow_info['outputs']}")
+                        
+                return history_data
+            else:
+                print(f"Failed to get workflow history: {history_response.getcode()}")
+                
+        except Exception as e:
+            print(f"Error getting workflow history: {e}")
+            
+        return {}
+
     def check_workflow_progress(self, timeout_seconds=300):
         """Monitor workflow progress via ComfyUI API"""
         import urllib.request
@@ -551,10 +621,7 @@ class WanFusionX:
     volumes={"/cache": vol},
     min_containers=0,
     scaledown_window=60 * 5,
-    timeout=60 * 60,
-    # gradio requires sticky sessions
-    # so we limit the number of concurrent containers to 1
-    # and allow it to scale to 100 concurrent inputs
+    timeout=60 * 10,
     max_containers=1,
 )
 @modal.concurrent(max_inputs=1000)
