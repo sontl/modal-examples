@@ -51,6 +51,34 @@ image = image.add_local_dir(
     copy=True,
 )
 
+# Configure ComfyUI-Manager to use offline mode to prevent registry data fetching at startup
+def setup_comfyui_manager_config():
+    import os
+    
+    # Create the ComfyUI-Manager config directory
+    config_dir = "/root/comfy/ComfyUI/user/default/ComfyUI-Manager"
+    os.makedirs(config_dir, exist_ok=True)
+    
+    # Create config.ini with offline network mode
+    config_content = """[default]
+# Set network mode to offline to prevent registry data fetching at startup
+# Options: public|private|offline
+network_mode = offline
+
+# Other optimizations
+file_logging = False
+bypass_ssl = True
+"""
+    
+    config_path = os.path.join(config_dir, "config.ini")
+    with open(config_path, "w") as f:
+        f.write(config_content)
+    
+    print(f"ComfyUI-Manager config created at: {config_path}")
+
+# Apply the ComfyUI-Manager configuration during image build
+image = image.run_function(setup_comfyui_manager_config)
+
 
 def hf_download():
     import os
@@ -618,7 +646,7 @@ class WanFusionX:
 
 # Create a separate FastAPI app for file uploads
 @app.function(
-    image=image.pip_install("python-multipart"),
+    image=image.pip_install("python-multipart", "httpx", "pillow"),
     volumes={"/cache": vol},
     min_containers=0,
     scaledown_window=60 * 5,
@@ -630,9 +658,57 @@ class WanFusionX:
 def fastapi_app():
     from fastapi import FastAPI, File, UploadFile, Form, HTTPException
     from fastapi.responses import Response
-    from typing import Optional
+    from typing import Optional, Union
+    import httpx
+    from PIL import Image
+    import io
 
     web_app = FastAPI(title="WanFusionX Image-to-Video API", docs_url="/docs")
+
+    async def download_image_from_url(url: str) -> bytes:
+        """Download image from URL and return as bytes"""
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                
+                # Validate content type
+                content_type = response.headers.get('content-type', '')
+                if not content_type.startswith('image/'):
+                    raise HTTPException(
+                        status_code=400, 
+                        detail=f"URL does not point to an image. Content-Type: {content_type}"
+                    )
+                
+                # Validate image by trying to open it
+                image_bytes = response.content
+                try:
+                    with Image.open(io.BytesIO(image_bytes)) as img:
+                        # Convert to RGB if necessary and save as PNG
+                        if img.mode in ('RGBA', 'LA', 'P'):
+                            img = img.convert('RGB')
+                        
+                        # Save as PNG to ensure compatibility
+                        output = io.BytesIO()
+                        img.save(output, format='PNG')
+                        return output.getvalue()
+                        
+                except Exception as e:
+                    raise HTTPException(
+                        status_code=400, 
+                        detail=f"Invalid image format: {str(e)}"
+                    )
+                    
+        except httpx.RequestError as e:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Failed to download image from URL: {str(e)}"
+            )
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"HTTP error {e.response.status_code} when downloading image"
+            )
 
     @web_app.post("/image-to-video")
     async def image_to_video(
@@ -658,8 +734,87 @@ def fastapi_app():
             headers={"Content-Disposition": f"attachment; filename=generated_{image.filename}.mp4"}
         )
 
+    @web_app.post("/image-to-video-url")
+    async def image_to_video_from_url(
+        image_url: str = Form(...),
+        prompt: Optional[str] = Form("The boys eyes glow and colored musical notes can be seen in the reflection.")
+    ):
+        """Generate video from an image URL"""
+        
+        # Download image from URL
+        image_content = await download_image_from_url(image_url)
+        
+        # Call the WanFusionX using the remote method
+        wan_fusion = WanFusionX()
+        result_bytes = wan_fusion.process_image_bytes.remote(image_content, prompt)
+        
+        # Extract filename from URL for response header
+        filename = image_url.split('/')[-1].split('?')[0] or "image"
+        if not filename.endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
+            filename += ".png"
+        
+        return Response(
+            content=result_bytes,
+            media_type="video/mp4",
+            headers={"Content-Disposition": f"attachment; filename=generated_{filename}.mp4"}
+        )
+
+    @web_app.post("/image-to-video-flexible")
+    async def image_to_video_flexible(
+        image: Optional[UploadFile] = File(None),
+        image_url: Optional[str] = Form(None),
+        prompt: Optional[str] = Form("The boys eyes glow and colored musical notes can be seen in the reflection.")
+    ):
+        """Generate video from either an uploaded image file or image URL"""
+        
+        if not image and not image_url:
+            raise HTTPException(
+                status_code=400, 
+                detail="Either 'image' file or 'image_url' must be provided"
+            )
+        
+        if image and image_url:
+            raise HTTPException(
+                status_code=400, 
+                detail="Provide either 'image' file or 'image_url', not both"
+            )
+        
+        # Handle file upload
+        if image:
+            # Validate file type
+            if not image.content_type or not image.content_type.startswith('image/'):
+                raise HTTPException(status_code=400, detail="File must be an image")
+            
+            image_content = await image.read()
+            filename = image.filename or "uploaded_image"
+            
+        # Handle URL
+        else:
+            image_content = await download_image_from_url(image_url)
+            filename = image_url.split('/')[-1].split('?')[0] or "image"
+            if not filename.endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
+                filename += ".png"
+        
+        # Call the WanFusionX using the remote method
+        wan_fusion = WanFusionX()
+        result_bytes = wan_fusion.process_image_bytes.remote(image_content, prompt)
+        
+        return Response(
+            content=result_bytes,
+            media_type="video/mp4",
+            headers={"Content-Disposition": f"attachment; filename=generated_{filename}.mp4"}
+        )
+
     @web_app.get("/")
     def root():
-        return {"message": "WanFusionX Image-to-Video API - Use POST /image-to-video to upload images and generate videos"}
+        return {
+            "message": "WanFusionX Image-to-Video API",
+            "endpoints": {
+                "/image-to-video": "Upload an image file and generate video",
+                "/image-to-video-url": "Provide an image URL and generate video", 
+                "/image-to-video-flexible": "Upload file OR provide URL and generate video",
+                "/docs": "API documentation"
+            }
+        }
 
     return web_app
