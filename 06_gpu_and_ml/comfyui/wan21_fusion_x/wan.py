@@ -212,14 +212,13 @@ app = modal.App(name="wan21-fusion-x", image=image)
 
 @app.cls(
     min_containers=0,
-    max_containers=1, 
-    gpu="L40S",
+    gpu="A10G",
     volumes={"/cache": vol},
-    timeout=60*10,
+    timeout=60*60,
     scaledown_window=60,  # 60 seconds
     enable_memory_snapshot=True,  # snapshot container state for faster cold starts
 )
-@modal.concurrent(max_inputs=10)
+@modal.concurrent(max_inputs=4)
 class WanFusionX:
     port: int = 8000
 
@@ -279,8 +278,8 @@ class WanFusionX:
         # Ensure CUDA environment is properly set for the subprocess
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = "0"
-        env["TORCH_CUDA_ARCH_LIST"] = "8.9"  # For L40S GPU (Ada Lovelace architecture)
-        # env["TORCH_CUDA_ARCH_LIST"] = "8.6"  # For A10G GPU (Ada Lovelace architecture)
+        # env["TORCH_CUDA_ARCH_LIST"] = "8.9"  # For L40S GPU (Ada Lovelace architecture)
+        env["TORCH_CUDA_ARCH_LIST"] = "8.6"  # For A10G GPU (Ada Lovelace architecture)
         
         # Force CUDA initialization in current process to ensure it's available
         if torch.cuda.is_available():
@@ -649,8 +648,8 @@ class WanFusionX:
     image=image.pip_install("python-multipart", "httpx", "pillow"),
     volumes={"/cache": vol},
     min_containers=0,
-    scaledown_window=60 * 5,
-    timeout=60 * 10,
+    scaledown_window=60 * 2,
+    timeout=60 * 60,
     max_containers=1,
 )
 @modal.concurrent(max_inputs=1000)
