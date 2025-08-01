@@ -43,7 +43,7 @@ image = (
         extra_options="--index-url https://download.pytorch.org/whl/cu121"
     )
     .pip_install(
-        "transformers",
+        "transformers==4.52",
         "diffusers",
         "accelerate",
         "safetensors",
@@ -306,6 +306,11 @@ __all__ = ['KPipeline']
                     local_dir=multitalk_dir, 
                     cache_dir="/data/cache"
                 )
+                snapshot_download(
+                    repo_id="MeiGen-AI/MeiGen-MultiTalk",
+                    local_dir="quant_models/t5_int8.safetensors",
+                    cache_dir="/data/cache"
+                )
                 
                 # Setup MultiTalk files in base model directory
                 self._setup_multitalk_files(multitalk_dir)
@@ -428,6 +433,8 @@ __all__ = ['KPipeline']
         sample_steps: int = 40,
         use_teacache: bool = True,
         low_vram: bool = False,
+        use_lora: bool = False,
+        use_quantization: bool = False,
         audio_data_person2: Optional[bytes] = None,
         audio_type: str = "single",  # "single", "add", or "para"
         bbox_person1: Optional[list] = None,
@@ -539,7 +546,18 @@ __all__ = ['KPipeline']
             
             if low_vram:
                 cmd.extend(["--num_persistent_param_in_dit", "0"])
-            
+
+            if use_lora:
+                cmd.extend(["--lora_dir", "weights/Wan2.1_I2V_14B_FusionX_LoRA.safetensors"])
+                cmd.extend(["--lora_scale", "1"])
+                cmd.extend(["--sample_text_guide_scale", "1.0"])
+                cmd.extend(["--sample_audio_guide_scale", "2.0"])
+                cmd.extend(["--sample_shift", "2"])
+
+            if use_quantization:
+                cmd.extend(["--quant", "int8"])
+                cmd.extend(["--quant_dir", "weights/MeiGen-MultiTalk"])
+
             print(f"Running MultiTalk generation...")
             print(f"Command: {' '.join(cmd)}")
             print(f"Working directory: /app")
@@ -667,6 +685,8 @@ def fastapi_app():
         sample_steps: int = Form(default=40, description="Number of sampling steps (10-50)"),
         use_teacache: bool = Form(default=True, description="Use TeaCache optimization"),
         low_vram: bool = Form(default=False, description="Enable low VRAM mode"),
+        use_lora: bool = Form(default=False, description="Enable LoRA acceleration"),
+        use_quantization: bool = Form(default=False, description="Enable INT8 quantization"),
         audio_person2: Optional[UploadFile] = File(None, description="Second person audio (optional)"),
         audio_type: str = Form(default="single", description="Audio type: single, add, or para"),
         bbox_person1: Optional[str] = Form(None, description="Bounding box for person1 as JSON array [x,y,w,h]"),
@@ -728,6 +748,8 @@ def fastapi_app():
                 sample_steps=sample_steps,
                 use_teacache=use_teacache,
                 low_vram=low_vram,
+                use_lora=use_lora,
+                use_quantization=use_quantization,
                 audio_data_person2=audio_data_person2,
                 audio_type=audio_type,
                 bbox_person1=bbox_person1_parsed,
@@ -767,6 +789,8 @@ def fastapi_app():
         sample_steps: int = Form(default=40),
         use_teacache: bool = Form(default=True),
         low_vram: bool = Form(default=False),
+        use_lora: bool = Form(default=False),
+        use_quantization: bool = Form(default=False),
         audio_person2: Optional[UploadFile] = File(None),
         audio_type: str = Form(default="single"),
         bbox_person1: Optional[str] = Form(None),
@@ -811,6 +835,8 @@ def fastapi_app():
                 sample_steps=sample_steps,
                 use_teacache=use_teacache,
                 low_vram=low_vram,
+                use_lora=use_lora,
+                use_quantization=use_quantization,
                 audio_data_person2=audio_data_person2,
                 audio_type=audio_type,
                 bbox_person1=bbox_person1_parsed,
