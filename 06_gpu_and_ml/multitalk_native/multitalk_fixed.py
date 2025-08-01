@@ -123,15 +123,19 @@ class MultiTalkFixed:
         multitalk_file = f"{self.base_dir}/multitalk.safetensors"
         quant_t5_file = "/data/weights/MeiGen-MultiTalk/quant_models/t5_int8.safetensors"
         lora_file = "/data/weights/FusionX_LoRa/Wan2.1_I2V_14B_FusionX_LoRA.safetensors"
+        quant_map_file = "/data/weights/FusionX_LoRa/quantization_map_int8_FusionX.json"
+        quant_lora_file = "/data/weights/MeiGen-MultiTalk/quant_models/quant_model_int8_FusionX.safetensors"
         
         # Check the main multitalk file and quantization files
         has_multitalk = os.path.exists(multitalk_file) and os.path.getsize(multitalk_file) > 0
         has_quant = os.path.exists(quant_t5_file) and os.path.getsize(quant_t5_file) > 0
         
-        # LoRA is optional, but if we're using it, it should exist
+        # LoRA and quantization map are required for LoRA+quantization usage
         has_lora = os.path.exists(lora_file) and os.path.getsize(lora_file) > 0
+        has_quant_map = os.path.exists(quant_map_file) and os.path.getsize(quant_map_file) > 0
+        has_quant_lora = os.path.exists(quant_lora_file) and os.path.getsize(quant_lora_file) > 0
         
-        return has_multitalk and has_quant and has_lora
+        return has_multitalk and has_quant and has_lora and has_quant_map and has_quant_lora
 
     @modal.enter()
     def setup(self):
@@ -326,8 +330,10 @@ __all__ = ['KPipeline']
                 quant_files = [
                     "t5_int8.safetensors",
                     "quantization_map_fp8_FusionX.json",
+                    "quantization_map_int8_FusionX.json",  # Add the missing int8 map
                     "dit_int8.safetensors",  # Add other potential quantization files
-                    "vae_int8.safetensors"
+                    "vae_int8.safetensors",
+                    "quant_model_int8_FusionX.safetensors"  # Add quantized LoRA model
                 ]
                 
                 for quant_file in quant_files:
@@ -372,6 +378,9 @@ __all__ = ['KPipeline']
                         print("✓ Downloaded LoRA weights from MeiGen-AI repo")
                     except Exception as fallback_error:
                         print(f"Warning: Could not download LoRA weights from either repo: {fallback_error}")
+                
+                # Copy quantization map to LoRA directory where it's expected
+                self._setup_quantization_maps(multitalk_dir)
                 
                 # Setup MultiTalk files in base model directory
                 self._setup_multitalk_files(multitalk_dir)
@@ -418,13 +427,47 @@ __all__ = ['KPipeline']
         else:
             print(f"Warning: MultiTalk weights not found at {multitalk_weights}")
     
+    def _setup_quantization_maps(self, multitalk_dir):
+        """Copy quantization map files to where they're expected"""
+        import shutil
+        
+        # Source quantization map file
+        source_map = f"{multitalk_dir}/quant_models/quantization_map_int8_FusionX.json"
+        
+        # Destination in LoRA directory where it's expected
+        lora_dir = "/data/weights/FusionX_LoRa"
+        os.makedirs(lora_dir, exist_ok=True)
+        dest_map = f"{lora_dir}/quantization_map_int8_FusionX.json"
+        
+        if os.path.exists(source_map):
+            shutil.copy2(source_map, dest_map)
+            print(f"Copied quantization map to {dest_map}")
+        else:
+            print(f"Warning: Quantization map not found at {source_map}")
+            
+            # Try to download it directly to the LoRA directory as fallback
+            try:
+                print("Attempting direct download of quantization map to LoRA directory...")
+                from huggingface_hub import hf_hub_download
+                hf_hub_download(
+                    repo_id="MeiGen-AI/MeiGen-MultiTalk",
+                    filename="quant_models/quantization_map_int8_FusionX.json",
+                    local_dir="/data/weights",
+                    cache_dir="/data/cache"
+                )
+                print("✓ Downloaded quantization map directly to LoRA directory")
+            except Exception as e:
+                print(f"Warning: Could not download quantization map directly: {e}")
+    
     def _verify_all_models(self):
         """Verify all required model files exist"""
         required_files = [
             f"{self.base_dir}/diffusion_pytorch_model.safetensors.index.json",
             f"{self.base_dir}/multitalk.safetensors",
             "/data/weights/MeiGen-MultiTalk/quant_models/t5_int8.safetensors",
-            "/data/weights/FusionX_LoRa/Wan2.1_I2V_14B_FusionX_LoRA.safetensors"
+            "/data/weights/FusionX_LoRa/Wan2.1_I2V_14B_FusionX_LoRA.safetensors",
+            "/data/weights/FusionX_LoRa/quantization_map_int8_FusionX.json",
+            "/data/weights/MeiGen-MultiTalk/quant_models/quant_model_int8_FusionX.safetensors"  # Quantized LoRA model
         ]
         
         # For wav2vec, check for either model.safetensors or pytorch_model.bin
@@ -611,11 +654,17 @@ __all__ = ['KPipeline']
                 cmd.extend(["--num_persistent_param_in_dit", "0"])
 
             if use_lora:
-                cmd.extend(["--lora_dir", "/data/weights/FusionX_LoRa/Wan2.1_I2V_14B_FusionX_LoRA.safetensors"])
+                if use_quantization:
+                    # Use quantized LoRA model when both LoRA and quantization are enabled
+                    cmd.extend(["--lora_dir", "/data/weights/MeiGen-MultiTalk/quant_models/quant_model_int8_FusionX.safetensors"])
+                else:
+                    # Use regular LoRA model when only LoRA is enabled
+                    cmd.extend(["--lora_dir", "/data/weights/FusionX_LoRa/Wan2.1_I2V_14B_FusionX_LoRA.safetensors"])
                 cmd.extend(["--lora_scale", "1"])
                 cmd.extend(["--sample_text_guide_scale", "1.0"])
                 cmd.extend(["--sample_audio_guide_scale", "2.0"])
                 cmd.extend(["--sample_shift", "2"])
+
 
             if use_quantization:
                 cmd.extend(["--quant", "int8"])
@@ -714,7 +763,8 @@ __all__ = ['KPipeline']
 # FastAPI web interface
 @app.function(
     image=image,
-    volumes={"/data": vol}
+    volumes={"/data": vol},
+    timeout=1800  # 30 minutes timeout
 )
 @modal.asgi_app()
 def fastapi_app():
