@@ -121,7 +121,13 @@ class MultiTalkFixed:
     def _check_multitalk_complete(self):
         """Check if MultiTalk weights are properly set up"""
         multitalk_file = f"{self.base_dir}/multitalk.safetensors"
-        return os.path.exists(multitalk_file) and os.path.getsize(multitalk_file) > 0
+        quant_t5_file = "/data/weights/MeiGen-MultiTalk/quant_models/t5_int8.safetensors"
+        
+        # Check both the main multitalk file and quantization files
+        has_multitalk = os.path.exists(multitalk_file) and os.path.getsize(multitalk_file) > 0
+        has_quant = os.path.exists(quant_t5_file) and os.path.getsize(quant_t5_file) > 0
+        
+        return has_multitalk and has_quant
 
     @modal.enter()
     def setup(self):
@@ -306,11 +312,49 @@ __all__ = ['KPipeline']
                     local_dir=multitalk_dir, 
                     cache_dir="/data/cache"
                 )
-                snapshot_download(
-                    repo_id="MeiGen-AI/MeiGen-MultiTalk",
-                    local_dir="quant_models/t5_int8.safetensors",
-                    cache_dir="/data/cache"
-                )
+                
+                # Download quantization models specifically
+                print("Downloading quantization models...")
+                quant_dir = f"{multitalk_dir}/quant_models"
+                os.makedirs(quant_dir, exist_ok=True)
+                
+                # Download specific quantization files
+                quant_files = [
+                    "t5_int8.safetensors",
+                    "quantization_map_fp8_FusionX.json",
+                    "dit_int8.safetensors",  # Add other potential quantization files
+                    "vae_int8.safetensors"
+                ]
+                
+                for quant_file in quant_files:
+                    try:
+                        print(f"Downloading {quant_file}...")
+                        hf_hub_download(
+                            repo_id="MeiGen-AI/MeiGen-MultiTalk",
+                            filename=f"quant_models/{quant_file}",
+                            local_dir=multitalk_dir,
+                            cache_dir="/data/cache"
+                        )
+                        print(f"✓ Downloaded {quant_file}")
+                    except Exception as e:
+                        print(f"Warning: Could not download {quant_file}: {e}")
+                        # For optional files, continue without failing
+                        if quant_file == "t5_int8.safetensors":
+                            # This is critical, re-raise the error
+                            raise
+                
+                # Download LoRA weights if available
+                try:
+                    print("Downloading LoRA weights...")
+                    hf_hub_download(
+                        repo_id="MeiGen-AI/MeiGen-MultiTalk",
+                        filename="Wan2.1_I2V_14B_FusionX_LoRA.safetensors",
+                        local_dir="/data/weights",
+                        cache_dir="/data/cache"
+                    )
+                    print("✓ Downloaded LoRA weights")
+                except Exception as e:
+                    print(f"Warning: Could not download LoRA weights: {e}")
                 
                 # Setup MultiTalk files in base model directory
                 self._setup_multitalk_files(multitalk_dir)
@@ -362,6 +406,7 @@ __all__ = ['KPipeline']
         required_files = [
             f"{self.base_dir}/diffusion_pytorch_model.safetensors.index.json",
             f"{self.base_dir}/multitalk.safetensors",
+            "/data/weights/MeiGen-MultiTalk/quant_models/t5_int8.safetensors"
         ]
         
         # For wav2vec, check for either model.safetensors or pytorch_model.bin
@@ -548,7 +593,7 @@ __all__ = ['KPipeline']
                 cmd.extend(["--num_persistent_param_in_dit", "0"])
 
             if use_lora:
-                cmd.extend(["--lora_dir", "weights/Wan2.1_I2V_14B_FusionX_LoRA.safetensors"])
+                cmd.extend(["--lora_dir", "/data/weights/Wan2.1_I2V_14B_FusionX_LoRA.safetensors"])
                 cmd.extend(["--lora_scale", "1"])
                 cmd.extend(["--sample_text_guide_scale", "1.0"])
                 cmd.extend(["--sample_audio_guide_scale", "2.0"])
@@ -556,7 +601,7 @@ __all__ = ['KPipeline']
 
             if use_quantization:
                 cmd.extend(["--quant", "int8"])
-                cmd.extend(["--quant_dir", "weights/MeiGen-MultiTalk"])
+                cmd.extend(["--quant_dir", "/data/weights/MeiGen-MultiTalk"])
 
             print(f"Running MultiTalk generation...")
             print(f"Command: {' '.join(cmd)}")
