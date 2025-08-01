@@ -381,6 +381,44 @@ __all__ = ['KPipeline']
         
         return all_good
     
+    def _validate_input_json(self, input_data: dict):
+        """Validate that the input JSON has the correct structure for MultiTalk"""
+        
+        # Required fields
+        required_fields = ["prompt", "cond_image", "cond_audio"]
+        for field in required_fields:
+            if field not in input_data:
+                raise ValueError(f"Missing required field: {field}")
+        
+        # Validate cond_audio structure
+        cond_audio = input_data["cond_audio"]
+        if not isinstance(cond_audio, dict):
+            raise ValueError("cond_audio must be a dictionary")
+        
+        if "person1" not in cond_audio:
+            raise ValueError("cond_audio must contain 'person1' key")
+        
+        # Validate files exist
+        if not os.path.exists(input_data["cond_image"]):
+            raise ValueError(f"Image file does not exist: {input_data['cond_image']}")
+        
+        if not os.path.exists(cond_audio["person1"]):
+            raise ValueError(f"Audio file for person1 does not exist: {cond_audio['person1']}")
+        
+        # If multi-person, validate person2
+        if "person2" in cond_audio:
+            if not os.path.exists(cond_audio["person2"]):
+                raise ValueError(f"Audio file for person2 does not exist: {cond_audio['person2']}")
+            
+            # audio_type should be specified for multi-person
+            if "audio_type" not in input_data:
+                print("Warning: audio_type not specified for multi-person audio, defaulting to 'add'")
+                input_data["audio_type"] = "add"
+            elif input_data["audio_type"] not in ["add", "para"]:
+                raise ValueError(f"Invalid audio_type for multi-person: {input_data['audio_type']}")
+        
+        print("✓ Input JSON structure validation passed")
+    
     @modal.method()
     def generate_video(
         self,
@@ -389,7 +427,11 @@ __all__ = ['KPipeline']
         prompt: str = "A person talking naturally",
         sample_steps: int = 40,
         use_teacache: bool = True,
-        low_vram: bool = False
+        low_vram: bool = False,
+        audio_data_person2: Optional[bytes] = None,
+        audio_type: str = "single",  # "single", "add", or "para"
+        bbox_person1: Optional[list] = None,
+        bbox_person2: Optional[list] = None
     ) -> Dict[str, str]:
         """Generate video from audio and image data"""
         
@@ -397,25 +439,63 @@ __all__ = ['KPipeline']
             # Save input files
             with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as audio_file:
                 audio_file.write(audio_data)
-                audio_path = audio_file.name
+                audio_path = os.path.abspath(audio_file.name)
             
             with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as image_file:
                 image_file.write(image_data)
-                image_path = image_file.name
+                image_path = os.path.abspath(image_file.name)
 
-            print(f"Audio file size: {os.path.getsize(audio_path)} bytes")
-            print(f"Image file size: {os.path.getsize(image_path)} bytes")
+            print(f"Audio file: {audio_path} ({os.path.getsize(audio_path)} bytes)")
+            print(f"Image file: {image_path} ({os.path.getsize(image_path)} bytes)")
             
-            # Create input JSON for MultiTalk
+            # Handle second person audio if provided
+            audio_path_person2 = None
+            if audio_data_person2:
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as audio_file2:
+                    audio_file2.write(audio_data_person2)
+                    audio_path_person2 = os.path.abspath(audio_file2.name)
+                print(f"Audio file person2: {audio_path_person2} ({os.path.getsize(audio_path_person2)} bytes)")
+            
+            # Create input JSON for MultiTalk based on the expected structure
             input_data = {
-                "audio_path": audio_path,
-                "reference_image": image_path,
-                "prompt": prompt
+                "prompt": prompt,
+                "cond_image": image_path
             }
             
+            # Handle different audio configurations
+            if audio_data_person2 and audio_type in ["add", "para"]:
+                # Multi-person audio
+                input_data["audio_type"] = audio_type
+                input_data["cond_audio"] = {
+                    "person1": audio_path,
+                    "person2": audio_path_person2
+                }
+                
+                # Add bounding boxes if provided
+                if bbox_person1 and bbox_person2:
+                    input_data["bbox"] = {
+                        "person1": bbox_person1,
+                        "person2": bbox_person2
+                    }
+            else:
+                # Single person audio (default format)
+                input_data["cond_audio"] = {
+                    "person1": audio_path
+                }
+            
             with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as json_file:
-                json.dump(input_data, json_file)
+                json.dump(input_data, json_file, indent=2)
                 json_path = json_file.name
+            
+            # Validate JSON structure
+            self._validate_input_json(input_data)
+            
+            # Debug: Print the JSON content
+            print(f"Generated JSON structure:")
+            print(json.dumps(input_data, indent=2))
+            print(f"JSON file path: {json_path}")
+            print(f"Audio type: {audio_type}")
+            print(f"Has second person audio: {audio_data_person2 is not None}")
             
             # Create output filename
             output_filename = f"output_{abs(hash(str(input_data)))}.mp4"
@@ -447,8 +527,11 @@ __all__ = ['KPipeline']
                 "--sample_steps", str(sample_steps),
                 "--mode", "streaming",
                 "--save_file", save_name,
-                "--size", "multitalk-480"
+                "--size", "multitalk-480",
             ]
+            
+            print(f"Command to execute: {' '.join(cmd)}")
+            print(f"Sample steps parameter: {sample_steps}")
             
             # Add optional flags
             if use_teacache:
@@ -524,6 +607,8 @@ __all__ = ['KPipeline']
             
             # Cleanup
             os.unlink(audio_path)
+            if audio_path_person2:
+                os.unlink(audio_path_person2)
             os.unlink(image_path)
             os.unlink(json_path)
             if os.path.exists(output_path):
@@ -581,7 +666,11 @@ def fastapi_app():
         prompt: str = Form(default="A person talking naturally", description="Generation prompt"),
         sample_steps: int = Form(default=40, description="Number of sampling steps (10-50)"),
         use_teacache: bool = Form(default=True, description="Use TeaCache optimization"),
-        low_vram: bool = Form(default=False, description="Enable low VRAM mode")
+        low_vram: bool = Form(default=False, description="Enable low VRAM mode"),
+        audio_person2: Optional[UploadFile] = File(None, description="Second person audio (optional)"),
+        audio_type: str = Form(default="single", description="Audio type: single, add, or para"),
+        bbox_person1: Optional[str] = Form(None, description="Bounding box for person1 as JSON array [x,y,w,h]"),
+        bbox_person2: Optional[str] = Form(None, description="Bounding box for person2 as JSON array [x,y,w,h]")
     ):
         """Generate talking video from audio and reference image"""
         
@@ -597,12 +686,39 @@ def fastapi_app():
             audio_data = await audio.read()
             image_data = await image.read()
             
+            # Handle second person audio
+            audio_data_person2 = None
+            if audio_person2:
+                audio_data_person2 = await audio_person2.read()
+            
+            # Parse bounding boxes if provided
+            bbox_person1_parsed = None
+            bbox_person2_parsed = None
+            if bbox_person1:
+                try:
+                    bbox_person1_parsed = json.loads(bbox_person1)
+                except json.JSONDecodeError:
+                    raise HTTPException(status_code=400, detail="Invalid bbox_person1 JSON format")
+            
+            if bbox_person2:
+                try:
+                    bbox_person2_parsed = json.loads(bbox_person2)
+                except json.JSONDecodeError:
+                    raise HTTPException(status_code=400, detail="Invalid bbox_person2 JSON format")
+            
             # Validate file sizes (optional)
             if len(audio_data) > 50 * 1024 * 1024:  # 50MB limit
                 raise HTTPException(status_code=400, detail="Audio file too large (max 50MB)")
             
+            if audio_data_person2 and len(audio_data_person2) > 50 * 1024 * 1024:
+                raise HTTPException(status_code=400, detail="Second audio file too large (max 50MB)")
+            
             if len(image_data) > 10 * 1024 * 1024:  # 10MB limit
                 raise HTTPException(status_code=400, detail="Image file too large (max 10MB)")
+            
+            # Validate audio_type
+            if audio_type not in ["single", "add", "para"]:
+                raise HTTPException(status_code=400, detail="audio_type must be 'single', 'add', or 'para'")
             
             # Generate video
             result = multitalk.generate_video.remote(
@@ -611,7 +727,11 @@ def fastapi_app():
                 prompt=prompt,
                 sample_steps=sample_steps,
                 use_teacache=use_teacache,
-                low_vram=low_vram
+                low_vram=low_vram,
+                audio_data_person2=audio_data_person2,
+                audio_type=audio_type,
+                bbox_person1=bbox_person1_parsed,
+                bbox_person2=bbox_person2_parsed
             )
             
             if result.get("success"):
@@ -646,7 +766,11 @@ def fastapi_app():
         prompt: str = Form(default="A person talking naturally"),
         sample_steps: int = Form(default=40),
         use_teacache: bool = Form(default=True),
-        low_vram: bool = Form(default=False)
+        low_vram: bool = Form(default=False),
+        audio_person2: Optional[UploadFile] = File(None),
+        audio_type: str = Form(default="single"),
+        bbox_person1: Optional[str] = Form(None),
+        bbox_person2: Optional[str] = Form(None)
     ):
         """Generate video and return as base64 JSON response"""
         
@@ -659,6 +783,26 @@ def fastapi_app():
             audio_data = await audio.read()
             image_data = await image.read()
             
+            # Handle second person audio
+            audio_data_person2 = None
+            if audio_person2:
+                audio_data_person2 = await audio_person2.read()
+            
+            # Parse bounding boxes if provided
+            bbox_person1_parsed = None
+            bbox_person2_parsed = None
+            if bbox_person1:
+                try:
+                    bbox_person1_parsed = json.loads(bbox_person1)
+                except json.JSONDecodeError:
+                    return {"success": False, "error": "Invalid bbox_person1 JSON format"}
+            
+            if bbox_person2:
+                try:
+                    bbox_person2_parsed = json.loads(bbox_person2)
+                except json.JSONDecodeError:
+                    return {"success": False, "error": "Invalid bbox_person2 JSON format"}
+            
             # Generate video
             result = multitalk.generate_video.remote(
                 audio_data=audio_data,
@@ -666,7 +810,11 @@ def fastapi_app():
                 prompt=prompt,
                 sample_steps=sample_steps,
                 use_teacache=use_teacache,
-                low_vram=low_vram
+                low_vram=low_vram,
+                audio_data_person2=audio_data_person2,
+                audio_type=audio_type,
+                bbox_person1=bbox_person1_parsed,
+                bbox_person2=bbox_person2_parsed
             )
             
             if result.get("success"):
@@ -699,7 +847,9 @@ def main(
     image_path: str,
     prompt: str = "A person talking naturally",
     sample_steps: int = 40,
-    output_path: str = "output.mp4"
+    output_path: str = "output.mp4",
+    audio_path_person2: Optional[str] = None,
+    audio_type: str = "single"
 ):
     """CLI interface for MultiTalk generation"""
     
@@ -709,13 +859,21 @@ def main(
     with open(image_path, 'rb') as f:
         image_data = f.read()
     
+    # Read second audio file if provided
+    audio_data_person2 = None
+    if audio_path_person2:
+        with open(audio_path_person2, 'rb') as f:
+            audio_data_person2 = f.read()
+    
     multitalk = MultiTalkFixed()
     
     result = multitalk.generate_video.remote(
         audio_data=audio_data,
         image_data=image_data,
         prompt=prompt,
-        sample_steps=sample_steps
+        sample_steps=sample_steps,
+        audio_data_person2=audio_data_person2,
+        audio_type=audio_type
     )
     
     if result.get("success"):
