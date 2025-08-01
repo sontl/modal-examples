@@ -1,0 +1,15 @@
+{
+  "audio_paths": [
+    "examples/audio/person1.wav",
+    "examples/audio/person2.wav"
+  ],
+  "reference_images": [
+    "examples/images/person1.jpg", 
+    "examples/images/person2.jpg"
+  ],
+  "prompts": [
+    "Person 1 speaking in a conversation",
+    "Person 2 responding in the conversation"
+  ],
+  "mode": "multi"
+}

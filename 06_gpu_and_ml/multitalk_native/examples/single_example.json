@@ -1,0 +1,6 @@
+{
+  "audio_path": "examples/audio/single_person.wav",
+  "reference_image": "examples/images/person1.jpg",
+  "prompt": "A person talking naturally with expressive facial movements",
+  "mode": "single"
+}

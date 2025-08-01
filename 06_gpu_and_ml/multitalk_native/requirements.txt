@@ -1,0 +1,40 @@
+# Core ML dependencies
+torch==2.4.1
+torchvision==0.19.1
+torchaudio==2.4.1
+xformers==0.0.28
+
+# Flash attention and optimization
+flash-attn
+ninja
+psutil
+packaging
+optimum-quanto
+sageattention
+
+# Audio/Video processing
+librosa
+soundfile
+opencv-python
+moviepy
+ffmpeg-python
+
+# ML frameworks
+transformers
+diffusers
+accelerate
+safetensors
+
+# Utilities
+pillow
+numpy
+scipy
+huggingface_hub[hf_transfer]
+
+# Web interface
+gradio
+fastapi
+uvicorn
+
+# Modal
+modal
