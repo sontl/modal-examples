@@ -160,6 +160,7 @@ with flux_kontext_nunchanku_endpoint_image.imports():
     scaledown_window=2,  # 1 seconds
     timeout=3600,  # 1 hour
     enable_memory_snapshot=True,
+    experimental_options={"enable_gpu_snapshot": True},
 )
 class FluxKontextnunchankuService:
     # ## Model optimization methods
@@ -167,105 +168,39 @@ class FluxKontextnunchankuService:
     # These methods apply various optimizations to make model inference faster.
     # The main optimizations are first block cache and torch compile.
 
-    def _optimize(self):
-         # apply first block cache, see: [ParaAttention](https://github.com/chengzeyi/ParaAttention)
-        # apply_cache_on_pipe(
-        #     self.pipe,
-        #     residual_diff_threshold=0.12,  # don't recommend going higher
-        # )
-        # Nunchaku handles most optimizations for the transformer
-        # We only apply optimizations to the VAE
-        self.pipe.transformer.to(memory_format=torch.channels_last)
-        self.pipe.vae.fuse_qkv_projections()
-        self.pipe.vae.to(memory_format=torch.channels_last)
 
-    def _compile(self):
-        # Load a real image for compilation
-        image_url = "https://i.ibb.co/TB3vGhfb/test-image.png"
-        real_image = load_image(str(image_url))
-        
-        print("triggering torch compile")
-        self.pipe(prompt="the girl is dancing", image=real_image, height=1024, width=1024, num_images_per_prompt=1)
+    # ## GPU Memory Snapshotting
 
-    # ## Mega-cache management
-
-    # PyTorch "mega-cache" serializes compiled model artifacts into a blob that
-    # can be easily transferred to another machine with the same GPU.
-
-    def _load_mega_cache(self):
-        print("loading torch mega-cache")
-        try:
-            if self.mega_cache_bin_path.exists():
-                with open(self.mega_cache_bin_path, "rb") as f:
-                    artifact_bytes = f.read()
-
-                if artifact_bytes:
-                    torch.compiler.load_cache_artifacts(artifact_bytes)
-            else:
-                print("torch mega cache not found, regenerating...")
-        except Exception as e:
-            print(f"error loading torch mega-cache: {e}")
-
-    def _save_mega_cache(self):
-        print("saving torch mega-cache")
-        try:
-            artifacts = torch.compiler.save_cache_artifacts()
-            artifact_bytes, _ = artifacts
-
-            with open(self.mega_cache_bin_path, "wb") as f:
-                f.write(artifact_bytes)
-
-            # persist changes to volume
-            CONTAINER_CACHE_VOLUME.commit()
-        except Exception as e:
-            print(f"error saving torch mega-cache: {e}")
-
-    # ## Memory Snapshotting
-
-    # We utilize memory snapshotting to avoid reloading model weights into host memory
-    # during subsequent container starts.
+    # We utilize GPU memory snapshotting to avoid reloading model weights and 
+    # recompiling optimizations during subsequent container starts. With GPU snapshots,
+    # we can load models directly to GPU and capture the entire GPU state including
+    # compiled artifacts, CUDA kernels, and optimized memory layouts.
 
     @modal.enter(snap=True)
     def load(self):
+        print("Loading FLUX Kontext pipeline with Nunchaku optimizations...")
+        
+        # Load base pipeline without transformer first
         print("Loading base pipeline...")
-        # Load base pipeline without transformer during snapshot
         self.pipe = FluxKontextPipeline.from_pretrained(
             "black-forest-labs/FLUX.1-Kontext-dev",
-            transformer=None,  # We'll load the transformer in setup
-            torch_dtype=torch.bfloat16
-        ).to("cpu")
-
-        # Initialize mega cache paths
-        mega_cache_dir = CONTAINER_CACHE_DIR / ".mega_cache"
-        mega_cache_dir.mkdir(parents=True, exist_ok=True)
-        self.mega_cache_bin_path = mega_cache_dir / "flux_torch_mega"
-
-    @modal.enter(snap=False)
-    def setup(self):
-        print("Initializing Nunchaku transformer...")
-        # Initialize Nunchaku transformer now that GPU is available
+            transformer=None,  # We'll load the Nunchaku transformer separately
+            torch_dtype=torch.bfloat16,
+            cache_dir=CONTAINER_CACHE_DIR
+        )
+        
+        # Initialize Nunchaku transformer directly on GPU
+        print("Loading Nunchaku transformer...")
         precision = "int4"
         transformer = NunchakuFluxTransformer2dModel.from_pretrained(
             f"mit-han-lab/nunchaku-flux.1-kontext-dev/svdq-{precision}_r32-flux.1-kontext-dev.safetensors"
         )
         transformer.set_attention_impl("nunchaku-fp16")
-
-        ### LoRA Related Code ###
-        # transformer.update_lora_params(
-        #     "alimama-creative/FLUX.1-Turbo-Alpha/diffusion_pytorch_model.safetensors"
-        # )  # Path to your LoRA safetensors, can also be a remote HuggingFace path
-        # transformer.set_lora_strength(1)  # Your LoRA strength here
-        ### End of LoRA Related Code ###
-
-        
-        # Set the transformer in the pipeline
+        # Set the transformer in the pipeline and move entire pipeline to GPU
         self.pipe.transformer = transformer
         self.pipe.to("cuda")
         
-        self._load_mega_cache()
-        self._optimize()
-        # self._compile()
-        self._save_mega_cache()
+        print("Pipeline loaded and optimized. Ready for GPU memory snapshot.")
 
     # ## The main inference endpoint
 

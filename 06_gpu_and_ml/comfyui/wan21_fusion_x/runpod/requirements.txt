@@ -1,0 +1,25 @@
+# RunPod ComfyUI Video Upscaler Dependencies
+
+# Core RunPod SDK
+runpod>=1.7.0
+
+# Web framework for API endpoints
+fastapi>=0.104.0
+uvicorn>=0.24.0
+
+# ComfyUI and related
+comfy-cli==1.4.1
+sageattention
+
+# Hugging Face for model downloads
+huggingface_hub[hf_transfer]>=0.30.0
+
+# Image/Video processing
+Pillow>=10.0.0
+opencv-python>=4.8.0
+
+# HTTP requests
+requests>=2.31.0
+
+# Utilities
+python-multipart>=0.0.6

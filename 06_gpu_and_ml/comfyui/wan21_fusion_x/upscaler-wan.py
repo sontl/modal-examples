@@ -143,14 +143,15 @@ app = modal.App(name="upscaler-wan", image=image)
 
 
 @app.cls(
-    max_containers=1,
+    min_containers=0,
+    max_containers=1, 
     gpu="L4",
     volumes={"/cache": vol},
     timeout=3600,
-    scaledown_window=30,  # 5 minutes
+    scaledown_window=60 * 2,  # 2 minutes
     enable_memory_snapshot=True,  # snapshot container state for faster cold starts
 )
-@modal.concurrent(max_inputs=10)
+@modal.concurrent(max_inputs=4)
 class UpscalerWan:
     port: int = 8000
 
@@ -199,29 +200,29 @@ class UpscalerWan:
         # If no video file found, raise an error
         raise FileNotFoundError(f"No video output found with prefix: {file_prefix}")
 
-    @modal.fastapi_endpoint(method="POST")
-    def api(self, video_filename: str):
-        from fastapi import Response
+    # @modal.fastapi_endpoint(method="POST")
+    # def api(self, video_filename: str):
+    #     from fastapi import Response
 
-        # Load the workflow template
-        workflow_data = json.loads(Path("/root/VideoUpscalerAPI.json").read_text())
+    #     # Load the workflow template
+    #     workflow_data = json.loads(Path("/root/VideoUpscalerAPI.json").read_text())
 
-        # Update the video input - expecting video filename in the request
-        workflow_data["1479"]["inputs"]["video"] = video_filename
+    #     # Update the video input - expecting video filename in the request
+    #     workflow_data["1479"]["inputs"]["video"] = video_filename
 
-        # Give the output video a unique id per client request
-        client_id = uuid.uuid4().hex
-        workflow_data["1435"]["inputs"]["filename_prefix"] = f"upscaled_{client_id}"
+    #     # Give the output video a unique id per client request
+    #     client_id = uuid.uuid4().hex
+    #     workflow_data["1435"]["inputs"]["filename_prefix"] = f"upscaled_{client_id}"
 
-        # Save this updated workflow to a new file
-        new_workflow_file = f"/tmp/{client_id}.json"
-        with open(new_workflow_file, "w") as f:
-            json.dump(workflow_data, f)
+    #     # Save this updated workflow to a new file
+    #     new_workflow_file = f"/tmp/{client_id}.json"
+    #     with open(new_workflow_file, "w") as f:
+    #         json.dump(workflow_data, f)
 
-        # Run inference on the currently running container
-        video_bytes = self.infer.local(new_workflow_file)
+    #     # Run inference on the currently running container
+    #     video_bytes = self.infer.local(new_workflow_file)
 
-        return Response(video_bytes, media_type="video/mp4")
+    #     return Response(video_bytes, media_type="video/mp4")
 
     @modal.method()
     def process_video_bytes(self, video: bytes):
@@ -297,6 +298,7 @@ class UpscalerWan:
     volumes={"/cache": vol},
     min_containers=0,
     scaledown_window=60 * 5,
+    timeout=60 * 60,
     # gradio requires sticky sessions
     # so we limit the number of concurrent containers to 1
     # and allow it to scale to 100 concurrent inputs

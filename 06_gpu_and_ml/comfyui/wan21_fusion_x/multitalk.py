@@ -211,11 +211,11 @@ def hf_download():
     # Download the LoRA model
     lora_model = hf_hub_download(
         repo_id="Kijai/WanVideo_comfy",
-        filename="Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank32.safetensors",
+        filename="Lightx2v/lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank32_bf16.safetensors",
         cache_dir="/cache",
     )
     subprocess.run(
-        f"ln -s {lora_model} /root/comfy/ComfyUI/models/loras/Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank32.safetensors",
+        f"ln -s {lora_model} /root/comfy/ComfyUI/models/loras/lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank32_bf16.safetensors",
         shell=True,
         check=True,
     )

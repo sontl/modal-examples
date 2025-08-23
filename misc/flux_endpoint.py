@@ -31,8 +31,8 @@ CONTAINER_CLOUD_MOUNT_DIR = Path("/outputs")
 CONTAINER_CACHE_VOLUME = modal.Volume.from_name("flux_endpoint", create_if_missing=True)
 
 # Configure your Cloudflare R2 bucket details here for image storage
-CLOUD_BUCKET_ACCOUNT_ID = "CLOUDFLARE ACCOUNT ID"
-CLOUD_BUCKET_NAME = "CLOUDFLARE R2 BUCKET NAME"
+CLOUD_BUCKET_ACCOUNT_ID = "1eebc6f67f1575b519cb04566b2a1112"
+CLOUD_BUCKET_NAME = "singmesong-modal"
 
 # ## Building the container image
 
@@ -136,7 +136,7 @@ with flux_endpoint_image.imports():
     secrets=[
         modal.Secret.from_name("huggingface-secret"),
         modal.Secret.from_name(
-            "r2-secret", required_keys=["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+            "aws-secret", required_keys=["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
         ),
     ],
     gpu="H100",
@@ -146,7 +146,7 @@ with flux_endpoint_image.imports():
             bucket_name=CLOUD_BUCKET_NAME,
             bucket_endpoint_url=f"https://{CLOUD_BUCKET_ACCOUNT_ID}.r2.cloudflarestorage.com",
             secret=modal.Secret.from_name(
-                "r2-secret",
+                "aws-secret",
                 required_keys=["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"],
             ),
         ),

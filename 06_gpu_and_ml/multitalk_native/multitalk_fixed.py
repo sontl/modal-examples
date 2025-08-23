@@ -17,6 +17,7 @@ flash_attn_release = (
     "flash_attn-2.7.4.post1+cu12torch2.4cxx11abiFALSE-cp310-cp310-linux_x86_64.whl"
 )
 
+
 # Build a minimal Modal image with proper dependencies
 image = (
     modal.Image.debian_slim(python_version="3.10")
@@ -360,7 +361,6 @@ __all__ = ['KPipeline']
                         repo_id="vrgamedevgirl84/Wan14BT2VFusioniX",
                         filename="FusionX_LoRa/Wan2.1_I2V_14B_FusionX_LoRA.safetensors",
                         local_dir="/data/weights",
-                        local_dir_use_symlinks=False,
                         cache_dir="/data/cache"
                     )
                     print("✓ Downloaded LoRA weights from vrgamedevgirl84 repo")

@@ -31,8 +31,8 @@ CONTAINER_CLOUD_MOUNT_DIR = Path("/outputs")
 CONTAINER_CACHE_VOLUME = modal.Volume.from_name("flux_kontext_endpoint", create_if_missing=True)
 
 # Configure your Cloudflare R2 bucket details here for image storage
-CLOUD_BUCKET_ACCOUNT_ID = ""
-CLOUD_BUCKET_NAME = ""
+CLOUD_BUCKET_ACCOUNT_ID = "1eebc6f67f1575b519cb04566b2a1112"
+CLOUD_BUCKET_NAME = "singmesong-modal"
 
 # ## Building the container image
 
@@ -80,7 +80,7 @@ flux_kontext_endpoint_image = (
         "HF_HUB_CACHE": str(CONTAINER_CACHE_DIR / ".hf_hub_cache"),
         "TORCHINDUCTOR_CACHE_DIR": str(CONTAINER_CACHE_DIR / ".inductor_cache"),
         "TRITON_CACHE_DIR": str(CONTAINER_CACHE_DIR / ".triton_cache"),
-        "TORCH_COMPILE_DEBUG": "1",  # Enable debug info for torch.compile
+        "TORCH_COMPILE_DEBUG": "0",  # Enable debug info for torch.compile
     })
 )
 
@@ -123,11 +123,13 @@ with flux_kontext_endpoint_image.imports():
         image_url: HttpUrl  # URL of the input image to edit
         prompt: str  # Edit instruction
         negative_prompt: Optional[str] = None
-        guidance_scale: float = Field(default=2.5, ge=0.0, le=20.0, multiple_of=0.1)
-        num_images: int = Field(default=1, ge=1, le=4)
+        height: Optional[int] = Field(default=None, ge=256, le=1024, multiple_of=16)
+        width: Optional[int] = Field(default=None, ge=256, le=1024, multiple_of=16)
+        guidance_scale: Optional[float] = Field(default=2.5, ge=0.0, le=20.0, multiple_of=0.1)
+        num_images: Optional[int] = Field(default=1, ge=1, le=4)
         seed: Optional[int] = None
-        output_format: OutputFormat = Field(default=OutputFormat.PNG)
-        output_quality: int = Field(default=90, ge=1, le=100)
+        output_format: Optional[OutputFormat] = Field(default=OutputFormat.PNG)
+        output_quality: Optional[int] = Field(default=90, ge=1, le=100)
 
 # ## The FluxService class
 
@@ -363,17 +365,29 @@ class FluxService:
         t0 = time.perf_counter()
 
         # Generate edited images using the FLUX Kontext pipeline
-        images = self.pipe(
-            image=input_image,
-            prompt=request.prompt,
-            negative_prompt=request.negative_prompt,
-            height=request.height,
-            width=request.width,
-            guidance_scale=request.guidance_scale,
-            num_images_per_prompt=request.num_images,
-            generator=generator,
-            output_type="np",
-        ).images
+        pipe_args = {
+            "image": input_image,
+            "prompt": request.prompt,
+        }
+        
+        # Add optional parameters if provided
+        if request.negative_prompt is not None:
+            pipe_args["negative_prompt"] = request.negative_prompt
+        if request.height is not None:
+            pipe_args["height"] = request.height
+        if request.width is not None:
+            pipe_args["width"] = request.width
+        if request.guidance_scale is not None:
+            pipe_args["guidance_scale"] = request.guidance_scale
+        if request.num_images is not None:
+            pipe_args["num_images_per_prompt"] = request.num_images
+        if generator is not None:
+            pipe_args["generator"] = generator
+
+        # Always set output type to numpy for post-processing
+        pipe_args["output_type"] = "np"
+
+        images = self.pipe(**pipe_args).images
 
         torch.cuda.synchronize()
         print(f"inference time: {time.perf_counter() - t0:.2f}s")
