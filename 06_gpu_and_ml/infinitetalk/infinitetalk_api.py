@@ -249,7 +249,7 @@ class InfiniteTalkRunner:
             # Create minimal JSON input matching InfiniteTalk examples
             input_json = {
                 "prompt": prompt,
-                "cond_image": image_path,
+                "cond_video": image_path,
                 # Single-person format expected by InfiniteTalk examples
                 "cond_audio": {"person1": audio_path},
             }
