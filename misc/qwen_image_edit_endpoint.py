@@ -160,7 +160,7 @@ with qwen_image_edit_endpoint_image.imports():
     secrets=[
         modal.Secret.from_name("huggingface-secret"),
     ],
-    gpu="L40S",
+    gpu="A10G",
     volumes={
         CONTAINER_CACHE_DIR: CONTAINER_CACHE_VOLUME,
     },
