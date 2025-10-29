@@ -32,7 +32,8 @@ nvidia_cuda_image = modal.Image.from_registry(
 flashvsr_image = (
     nvidia_cuda_image
     .apt_install(
-        "git", "git-lfs", "ffmpeg", "build-essential", "ninja-build", "cmake"
+        "git", "git-lfs", "ffmpeg", "build-essential", "ninja-build", "cmake",
+        "clang", "python3-clang"  # Required for Block Sparse Attention compilation
     )
     .run_commands(
         # Setup Git LFS
@@ -48,15 +49,18 @@ flashvsr_image = (
         # Install FlashVSR dependencies first
         "cd FlashVSR && pip install -r requirements.txt",
         
-        # Try to install flash-attn (may fail, but FlashVSR can work without it)
-        "pip install flash-attn --no-build-isolation || echo 'flash-attn installation failed, continuing...'",
+        # Install wheel package first (required for CUDA extensions)
+        "pip install wheel setuptools",
+        
+        # Install flash-attn with proper CUDA environment
+        "CUDA_HOME=/usr/local/cuda MAX_JOBS=4 pip install flash-attn --no-build-isolation",
         
         # Install FlashVSR
         "cd FlashVSR && pip install -e .",
         
-        # Try to install Block-Sparse Attention (optional)
-        "cd FlashVSR && git clone https://github.com/microsoft/BlockSparseAttention.git || echo 'BlockSparseAttention clone failed'",
-        "cd FlashVSR/BlockSparseAttention && pip install -e . || echo 'BlockSparseAttention installation failed, FlashVSR will use dense attention'",
+        # Install MIT Han Lab Block-Sparse Attention (required)
+        "git clone https://github.com/mit-han-lab/Block-Sparse-Attention.git /tmp/block-sparse-attention",
+        "cd /tmp/block-sparse-attention && CUDA_HOME=/usr/local/cuda MAX_JOBS=4 pip install -e . --no-build-isolation",
     )
     .pip_install(
         "fastapi[standard]==0.115.12",
@@ -66,12 +70,19 @@ flashvsr_image = (
         "modelscope",  # Required by FlashVSR
         "einops",
         "tqdm",
-        "opencv-python",  # For fallback upscaling
+        "wheel",  # Required for CUDA extensions
         "triton",  # Required for flash-attn
+        "pybind11",  # Required for CUDA extensions
+        "packaging",  # Required for version parsing
     )
     .env({
         "HF_HUB_ENABLE_HF_TRANSFER": "1",
         "PYTHONPATH": "/FlashVSR",
+        "CUDA_HOME": "/usr/local/cuda",
+        "PATH": "/usr/local/cuda/bin:$PATH",
+        "LD_LIBRARY_PATH": "/usr/local/cuda/lib64:$LD_LIBRARY_PATH",
+        "TORCH_CUDA_ARCH_LIST": "8.0;8.6;8.9;9.0",  # Support for A100, RTX 30/40 series, H100
+        "MAX_JOBS": "4",  # Limit parallel compilation to avoid OOM
     })
     .workdir("/FlashVSR")
 )
@@ -89,7 +100,7 @@ with flashvsr_image.imports():
     import imageio
     from tqdm import tqdm
     import torch
-    import cv2
+
     from einops import rearrange
     from pydantic import BaseModel, Field, HttpUrl
     from fastapi import Response, HTTPException
@@ -100,53 +111,20 @@ with flashvsr_image.imports():
         from utils.utils import Buffer_LQ4x_Proj
         from utils.TCDecoder import build_tcdecoder
         FLASHVSR_AVAILABLE = True
+        print("✅ FlashVSR imported successfully")
     except ImportError as e:
-        print(f"FlashVSR imports failed: {e}")
-        print("Will use fallback implementation")
+        print(f"❌ FlashVSR imports failed: {e}")
         FLASHVSR_AVAILABLE = False
-        
-        # Create dummy classes for fallback
-        class ModelManager:
-            def __init__(self, *args, **kwargs):
-                pass
-            def load_models(self, *args, **kwargs):
-                pass
-        
-        class FlashVSRTinyPipeline:
-            @classmethod
-            def from_model_manager(cls, *args, **kwargs):
-                return cls()
-            def __call__(self, *args, **kwargs):
-                # Get actual dimensions from kwargs if available
-                num_frames = kwargs.get('num_frames', 10)
-                height = kwargs.get('height', 512) 
-                width = kwargs.get('width', 512)
-                return torch.randn(3, num_frames, height, width, device='cuda', dtype=torch.float32)  # C T H W
-        
-        class FlashVSRFullPipeline:
-            @classmethod
-            def from_model_manager(cls, *args, **kwargs):
-                return cls()
-            def __call__(self, *args, **kwargs):
-                # Get actual dimensions from kwargs if available
-                num_frames = kwargs.get('num_frames', 10)
-                height = kwargs.get('height', 512) 
-                width = kwargs.get('width', 512)
-                return torch.randn(3, num_frames, height, width, device='cuda', dtype=torch.float32)  # C T H W
-        
-        class Buffer_LQ4x_Proj:
-            def __init__(self, *args, **kwargs):
-                pass
-            def to(self, *args, **kwargs):
-                return self
-            def load_state_dict(self, *args, **kwargs):
-                pass
-        
-        def build_tcdecoder(*args, **kwargs):
-            class DummyDecoder:
-                def load_state_dict(self, *args, **kwargs):
-                    return {}
-            return DummyDecoder()
+    
+    # Check for Block Sparse Attention
+    try:
+        import block_sparse_attn
+        BLOCK_SPARSE_AVAILABLE = True
+        print("✅ Block Sparse Attention imported successfully")
+    except ImportError as e:
+        print(f"❌ Block Sparse Attention import failed: {e}")
+        BLOCK_SPARSE_AVAILABLE = False
+
 
     class ModelType(Enum):
         FULL = "full"
@@ -312,6 +290,13 @@ class FlashVSRService:
         
         self.model_path = model_path
         self.pipelines = {}  # Cache pipelines
+        
+        # Verify required components are available
+        if not FLASHVSR_AVAILABLE:
+            raise RuntimeError("FlashVSR is not available. Check installation logs.")
+        if not BLOCK_SPARSE_AVAILABLE:
+            print("⚠️  Block Sparse Attention is not available. FlashVSR will use dense attention.")
+        
         print("FlashVSR setup complete")
 
     def init_pipeline(self, model_type: str):
@@ -322,19 +307,7 @@ class FlashVSRService:
         print(f"Initializing {model_type} pipeline...")
         
         if not FLASHVSR_AVAILABLE:
-            print("FlashVSR not available, using fallback pipeline")
-            # Create a simple fallback pipeline
-            class FallbackPipeline:
-                def __call__(self, *args, **kwargs):
-                    # Get actual dimensions from kwargs if available
-                    num_frames = kwargs.get('num_frames', 10)
-                    height = kwargs.get('height', 512) 
-                    width = kwargs.get('width', 512)
-                    return torch.randn(3, num_frames, height, width, device='cuda', dtype=torch.float32)
-            
-            pipe = FallbackPipeline()
-            self.pipelines[model_type] = pipe
-            return pipe
+            raise RuntimeError("FlashVSR is not available. Please check the installation logs.")
         
         print(torch.cuda.current_device(), torch.cuda.get_device_name(torch.cuda.current_device()))
         
@@ -380,33 +353,11 @@ class FlashVSRService:
             
         except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
             print(f"Failed to initialize FlashVSR pipeline (likely OOM): {e}")
-            print("Using fallback pipeline due to memory constraints")
-            
-            # Clear memory and use fallback
             torch.cuda.empty_cache()
-            
-            class FallbackPipeline:
-                def __call__(self, *args, **kwargs):
-                    # Get actual dimensions from kwargs if available
-                    num_frames = kwargs.get('num_frames', 10)
-                    height = kwargs.get('height', 512) 
-                    width = kwargs.get('width', 512)
-                    return torch.randn(3, num_frames, height, width, device='cuda', dtype=torch.float32)
-            
-            pipe = FallbackPipeline()
+            raise RuntimeError(f"FlashVSR pipeline initialization failed: {e}")
         except Exception as e:
             print(f"Failed to initialize FlashVSR pipeline: {e}")
-            print("Using fallback pipeline")
-            
-            class FallbackPipeline:
-                def __call__(self, *args, **kwargs):
-                    # Get actual dimensions from kwargs if available
-                    num_frames = kwargs.get('num_frames', 10)
-                    height = kwargs.get('height', 512) 
-                    width = kwargs.get('width', 512)
-                    return torch.randn(3, num_frames, height, width, device='cuda', dtype=torch.float32)
-            
-            pipe = FallbackPipeline()
+            raise RuntimeError(f"FlashVSR pipeline initialization failed: {e}")
         
         self.pipelines[model_type] = pipe
         print(f"{model_type} pipeline initialized")
@@ -482,39 +433,11 @@ class FlashVSRService:
                     raise RuntimeError("Using fallback inference")
             except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
                 print(f"FlashVSR inference failed (likely OOM): {e}")
-                print("Falling back to OpenCV upscaling")
-                # Fallback: simple upscaling using OpenCV
-                print("Using OpenCV fallback for super-resolution")
-                # Convert LQ tensor to float32 to avoid BFloat16 issues
-                LQ_float = LQ.float() if LQ.dtype == torch.bfloat16 else LQ
-                
-                upscaled_frames = []
-                for i in range(F):
-                    if i < LQ_float.shape[2]:  # Check against the actual tensor dimension
-                        frame_tensor = LQ_float[0][:, i, :, :]
-                        # Convert tensor to numpy
-                        frame = frame_tensor.permute(1, 2, 0).cpu().numpy()
-                        frame = ((frame + 1) * 127.5).clip(0, 255).astype(np.uint8)
-                        
-                        # Upscale using OpenCV
-                        h, w = frame.shape[:2]
-                        upscaled = cv2.resize(
-                            frame, 
-                            (w * request.scale, h * request.scale), 
-                            interpolation=cv2.INTER_CUBIC
-                        )
-                        
-                        # Convert back to tensor format
-                        upscaled_tensor = torch.from_numpy(upscaled).float() / 127.5 - 1.0
-                        upscaled_tensor = upscaled_tensor.permute(2, 0, 1).to(device='cuda')
-                        upscaled_frames.append(upscaled_tensor)
-                
-                # Stack frames into video tensor - ensure correct shape [C, T, H, W]
-                if upscaled_frames:
-                    video = torch.stack(upscaled_frames, dim=1)  # C T H W
-                else:
-                    # Fallback if no frames processed
-                    video = torch.randn(3, F, th, tw, device='cuda', dtype=torch.float32)
+                torch.cuda.empty_cache()
+                raise HTTPException(status_code=500, detail=f"FlashVSR inference failed due to memory constraints: {e}")
+            except Exception as e:
+                print(f"FlashVSR inference failed: {e}")
+                raise HTTPException(status_code=500, detail=f"FlashVSR inference failed: {e}")
             
             inference_time = time.time() - start_time
             print(f"FlashVSR inference completed in {inference_time:.2f}s")
