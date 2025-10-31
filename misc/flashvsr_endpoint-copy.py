@@ -107,43 +107,34 @@ with flashvsr_image.imports():
         if path not in sys.path:
             sys.path.insert(0, path)
     
-    # Import FlashVSR components (with error handling)
+    # Import FlashVSR components using direct file imports (most reliable method)
     try:
+        import importlib.util
+        
+        # Import utils.utils from the full path
+        utils_spec = importlib.util.spec_from_file_location(
+            "utils.utils", "/FlashVSR/examples/WanVSR/utils/utils.py"
+        )
+        utils_module = importlib.util.module_from_spec(utils_spec)
+        utils_spec.loader.exec_module(utils_module)
+        Buffer_LQ4x_Proj = utils_module.Buffer_LQ4x_Proj
+        
+        # Import TCDecoder
+        tcdecoder_spec = importlib.util.spec_from_file_location(
+            "utils.TCDecoder", "/FlashVSR/examples/WanVSR/utils/TCDecoder.py"
+        )
+        tcdecoder_module = importlib.util.module_from_spec(tcdecoder_spec)
+        tcdecoder_spec.loader.exec_module(tcdecoder_module)
+        build_tcdecoder = tcdecoder_module.build_tcdecoder
+        
+        # Import diffsynth (available from pip install)
         from diffsynth import ModelManager, FlashVSRTinyPipeline, FlashVSRFullPipeline
-        from utils.utils import Buffer_LQ4x_Proj
-        from utils.TCDecoder import build_tcdecoder
+        
         FLASHVSR_AVAILABLE = True
         print("✅ FlashVSR imported successfully")
-    except ImportError as e:
-        print(f"❌ FlashVSR imports failed with direct import: {e}")
-        # Try alternative import paths
-        try:
-            import importlib.util
-            
-            # Try to import utils.utils from the full path
-            utils_spec = importlib.util.spec_from_file_location(
-                "utils.utils", "/FlashVSR/examples/WanVSR/utils/utils.py"
-            )
-            utils_module = importlib.util.module_from_spec(utils_spec)
-            utils_spec.loader.exec_module(utils_module)
-            Buffer_LQ4x_Proj = utils_module.Buffer_LQ4x_Proj
-            
-            # Try to import TCDecoder
-            tcdecoder_spec = importlib.util.spec_from_file_location(
-                "utils.TCDecoder", "/FlashVSR/examples/WanVSR/utils/TCDecoder.py"
-            )
-            tcdecoder_module = importlib.util.module_from_spec(tcdecoder_spec)
-            tcdecoder_spec.loader.exec_module(tcdecoder_module)
-            build_tcdecoder = tcdecoder_module.build_tcdecoder
-            
-            # Import diffsynth (should be available from pip install)
-            from diffsynth import ModelManager, FlashVSRTinyPipeline, FlashVSRFullPipeline
-            
-            FLASHVSR_AVAILABLE = True
-            print("✅ FlashVSR imported successfully via alternative method")
-        except Exception as e2:
-            print(f"❌ FlashVSR imports failed completely: {e2}")
-            FLASHVSR_AVAILABLE = False
+    except Exception as e:
+        print(f"❌ FlashVSR imports failed: {e}")
+        FLASHVSR_AVAILABLE = False
     
     # Check for Block Sparse Attention
     try:
@@ -193,7 +184,9 @@ with flashvsr_image.imports():
         return 0 if n < 1 else ((n - 1)//8)*8 + 1
 
     def pil_to_tensor_neg1_1(img: Image.Image, dtype=torch.bfloat16, device='cuda'):
-        t = torch.from_numpy(np.asarray(img, np.uint8)).to(device=device, dtype=torch.float32)  # HWC
+        # Convert PIL to numpy array and make a copy to avoid the non-writable tensor warning
+        img_array = np.array(img, dtype=np.uint8).copy()
+        t = torch.from_numpy(img_array).to(device=device, dtype=torch.float32)  # HWC
         t = t.permute(2,0,1) / 255.0 * 2.0 - 1.0  # CHW in [-1,1]
         return t.to(dtype)
 
@@ -292,6 +285,7 @@ with flashvsr_image.imports():
     gpu="A100-80GB",
     volumes={CONTAINER_CACHE_DIR: CONTAINER_CACHE_VOLUME},
     timeout=3600,
+    scaledown_window=10,  # 10 seconds
     enable_memory_snapshot=True,
     experimental_options={"enable_gpu_snapshot": True},
 )
