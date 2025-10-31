@@ -17,7 +17,7 @@ import modal
 
 # Container mount directories
 CONTAINER_CACHE_DIR = Path("/cache")
-CONTAINER_CACHE_VOLUME = modal.Volume.from_name("flashvsr_endpoint", create_if_missing=True)
+CONTAINER_CACHE_VOLUME = modal.Volume.from_name("flashvsr_endpoint_2", create_if_missing=True)
 
 # Build FlashVSR environment following official setup
 cuda_version = "12.4.1"  # Updated to match FlashVSR requirements
@@ -35,63 +35,55 @@ flashvsr_image = (
         "git", "git-lfs", "ffmpeg", "build-essential", "ninja-build", "cmake",
         "clang", "python3-clang"  # Required for Block Sparse Attention compilation
     )
-    .run_commands(
-        # Setup Git LFS
-        "git lfs install",
-        
-        # Clone FlashVSR repository
-        "git clone https://github.com/OpenImagingLab/FlashVSR.git",
-        "cd FlashVSR && git lfs pull",
-        
-        # Install PyTorch with CUDA 12.4 to match FlashVSR requirements
-        "pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124",
-        
-        # Install FlashVSR dependencies first
-        "cd FlashVSR && pip install -r requirements.txt",
-        
-        # Install wheel package first (required for CUDA extensions)
-        "pip install wheel setuptools",
-        
-        # Install flash-attn with proper CUDA environment
-        "CUDA_HOME=/usr/local/cuda MAX_JOBS=4 pip install flash-attn --no-build-isolation",
-        
-        # Install FlashVSR
-        "cd FlashVSR && pip install -e .",
-        
-        # Install MIT Han Lab Block-Sparse Attention (required)
-        "git clone https://github.com/mit-han-lab/Block-Sparse-Attention.git /tmp/block-sparse-attention",
-        "cd /tmp/block-sparse-attention && CUDA_HOME=/usr/local/cuda MAX_JOBS=4 pip install -e . --no-build-isolation",
-    )
     .pip_install(
         "fastapi[standard]==0.115.12",
         "pydantic==2.11.4", 
         "requests>=2.32.2",  # Updated to satisfy datasets requirement
-        "huggingface-hub[hf_transfer]==0.34.4",  # Updated to match diffsynth requirement
         "modelscope",  # Required by FlashVSR
-        "einops",
-        "tqdm",
         "wheel",  # Required for CUDA extensions
-        "triton",  # Required for flash-attn
         "pybind11",  # Required for CUDA extensions
         "packaging",  # Required for version parsing
+        "ninja",
+        "huggingface_hub",  # Required for model downloads
+    )
+    .run_commands(
+        # Setup Git LFS
+        "git lfs install",
+        "rm -rf /FlashVSR/**",
+        # Clone FlashVSR repository
+        "git clone https://github.com/sontl/FlashVSR.git /FlashVSR",
+        # Install FlashVSR dependencies
+        "cd /FlashVSR && pip install -r requirements.txt",
+        "cd /FlashVSR && pip install -e .",
+        # Also install from the examples/WanVSR directory if it has setup
+        "cd /FlashVSR/examples/WanVSR && [ -f requirements.txt ] && pip install -r requirements.txt || true",
+    )
+    .run_commands( 
+        # Install MIT Han Lab Block-Sparse Attention (required)
+        "git clone https://github.com/mit-han-lab/Block-Sparse-Attention.git",
+        "cd Block-Sparse-Attention && CUDA_HOME=/usr/local/cuda MAX_JOBS=4 python setup.py install",
     )
     .env({
         "HF_HUB_ENABLE_HF_TRANSFER": "1",
-        "PYTHONPATH": "/FlashVSR",
+        "PYTHONPATH": "/FlashVSR:/FlashVSR/examples/WanVSR",
         "CUDA_HOME": "/usr/local/cuda",
         "PATH": "/usr/local/cuda/bin:$PATH",
         "LD_LIBRARY_PATH": "/usr/local/cuda/lib64:$LD_LIBRARY_PATH",
         "TORCH_CUDA_ARCH_LIST": "8.0;8.6;8.9;9.0",  # Support for A100, RTX 30/40 series, H100
         "MAX_JOBS": "4",  # Limit parallel compilation to avoid OOM
+        "FLASH_ATTENTION_SKIP_CUDA_BUILD": "FALSE",  # Ensure CUDA build for flash-attn
+        "NVCC_PREPEND_FLAGS": "-ccbin clang++",  # Use clang++ for NVCC compilation
     })
-    .workdir("/FlashVSR")
+    .workdir("/FlashVSR/examples/WanVSR")
 )
 
-app = modal.App("flashvsr_endpoint", image=flashvsr_image)
+app = modal.App("flashvsr_endpoint_2", image=flashvsr_image)
 
 with flashvsr_image.imports():
     import time
     import re
+    import sys
+    import os
     from enum import Enum
     from typing import Optional
     import requests
@@ -105,6 +97,16 @@ with flashvsr_image.imports():
     from pydantic import BaseModel, Field, HttpUrl
     from fastapi import Response, HTTPException
     
+    # Add FlashVSR paths to sys.path
+    flashvsr_paths = [
+        '/FlashVSR',
+        '/FlashVSR/examples/WanVSR',
+        '/FlashVSR/examples/WanVSR/utils',
+    ]
+    for path in flashvsr_paths:
+        if path not in sys.path:
+            sys.path.insert(0, path)
+    
     # Import FlashVSR components (with error handling)
     try:
         from diffsynth import ModelManager, FlashVSRTinyPipeline, FlashVSRFullPipeline
@@ -113,8 +115,35 @@ with flashvsr_image.imports():
         FLASHVSR_AVAILABLE = True
         print("✅ FlashVSR imported successfully")
     except ImportError as e:
-        print(f"❌ FlashVSR imports failed: {e}")
-        FLASHVSR_AVAILABLE = False
+        print(f"❌ FlashVSR imports failed with direct import: {e}")
+        # Try alternative import paths
+        try:
+            import importlib.util
+            
+            # Try to import utils.utils from the full path
+            utils_spec = importlib.util.spec_from_file_location(
+                "utils.utils", "/FlashVSR/examples/WanVSR/utils/utils.py"
+            )
+            utils_module = importlib.util.module_from_spec(utils_spec)
+            utils_spec.loader.exec_module(utils_module)
+            Buffer_LQ4x_Proj = utils_module.Buffer_LQ4x_Proj
+            
+            # Try to import TCDecoder
+            tcdecoder_spec = importlib.util.spec_from_file_location(
+                "utils.TCDecoder", "/FlashVSR/examples/WanVSR/utils/TCDecoder.py"
+            )
+            tcdecoder_module = importlib.util.module_from_spec(tcdecoder_spec)
+            tcdecoder_spec.loader.exec_module(tcdecoder_module)
+            build_tcdecoder = tcdecoder_module.build_tcdecoder
+            
+            # Import diffsynth (should be available from pip install)
+            from diffsynth import ModelManager, FlashVSRTinyPipeline, FlashVSRFullPipeline
+            
+            FLASHVSR_AVAILABLE = True
+            print("✅ FlashVSR imported successfully via alternative method")
+        except Exception as e2:
+            print(f"❌ FlashVSR imports failed completely: {e2}")
+            FLASHVSR_AVAILABLE = False
     
     # Check for Block Sparse Attention
     try:
@@ -272,23 +301,13 @@ class FlashVSRService:
     def setup(self):
         print("Setting up FlashVSR...")
         
-        # Download model weights
+        # Download model weights using Git LFS (as per FlashVSR documentation)
         model_path = str(CONTAINER_CACHE_DIR / "FlashVSR")
-        if not os.path.exists(model_path):
-            print("Downloading FlashVSR model weights...")
-            os.makedirs(model_path, exist_ok=True)
-            try:
-                from huggingface_hub import snapshot_download
-                snapshot_download(
-                    repo_id="JunhaoZhuang/FlashVSR",
-                    local_dir=model_path,
-                    cache_dir=str(CONTAINER_CACHE_DIR / ".hf_hub_cache")
-                )
-                print("Model weights downloaded successfully")
-            except Exception as e:
-                print(f"Model download failed: {e}")
-        
         self.model_path = model_path
+        
+        # Always try to ensure model files are available
+        self._ensure_model_files()
+        
         self.pipelines = {}  # Cache pipelines
         
         # Verify required components are available
@@ -298,6 +317,145 @@ class FlashVSRService:
             print("⚠️  Block Sparse Attention is not available. FlashVSR will use dense attention.")
         
         print("FlashVSR setup complete")
+
+    def _ensure_model_files(self):
+        """Ensure model files are downloaded and available"""
+        model_path = self.model_path
+        
+        # Check if all required files exist and are not LFS placeholders
+        required_files = [
+            "diffusion_pytorch_model_streaming_dmd.safetensors",
+            "LQ_proj_in.ckpt", 
+            "TCDecoder.ckpt",
+            "Wan2.1_VAE.pth"
+        ]
+        
+        def check_files():
+            missing = []
+            for file in required_files:
+                file_path = os.path.join(model_path, file)
+                if not os.path.exists(file_path):
+                    missing.append(file)
+                else:
+                    size = os.path.getsize(file_path)
+                    if size < 1000:  # LFS placeholder files are tiny
+                        missing.append(f"{file} (size: {size}B, likely LFS placeholder)")
+            return missing
+        
+        missing_files = check_files()
+        
+        if missing_files:
+            print(f"Missing model files: {missing_files}")
+            print("Downloading FlashVSR model weights using Git LFS...")
+            os.makedirs(str(CONTAINER_CACHE_DIR), exist_ok=True)
+            
+            try:
+                import subprocess
+                import shutil
+                
+                # Remove existing directory if it exists but is incomplete
+                if os.path.exists(model_path):
+                    print(f"Removing incomplete model directory: {model_path}")
+                    shutil.rmtree(model_path)
+                
+                # Try multiple download strategies
+                success = False
+                
+                # Strategy 1: Direct git lfs clone
+                try:
+                    print("Trying git lfs clone...")
+                    result = subprocess.run([
+                        "git", "lfs", "clone", 
+                        "https://huggingface.co/JunhaoZhuang/FlashVSR",
+                        model_path
+                    ], cwd=str(CONTAINER_CACHE_DIR), capture_output=True, text=True, timeout=300)
+                    
+                    if result.returncode == 0:
+                        print("Git LFS clone successful")
+                        success = True
+                    else:
+                        print(f"Git LFS clone failed: {result.stderr}")
+                except Exception as e:
+                    print(f"Git LFS clone exception: {e}")
+                
+                # Strategy 2: Regular clone + LFS pull
+                if not success:
+                    try:
+                        print("Trying regular git clone + lfs pull...")
+                        subprocess.run([
+                            "git", "clone", 
+                            "https://huggingface.co/JunhaoZhuang/FlashVSR", 
+                            model_path
+                        ], cwd=str(CONTAINER_CACHE_DIR), check=True, timeout=120)
+                        
+                        subprocess.run([
+                            "git", "lfs", "pull"
+                        ], cwd=model_path, check=True, timeout=300)
+                        
+                        print("Git clone + LFS pull successful")
+                        success = True
+                    except Exception as e:
+                        print(f"Git clone + LFS pull failed: {e}")
+                
+                # Strategy 3: Fallback to huggingface_hub with git lfs
+                if not success:
+                    try:
+                        print("Trying huggingface_hub snapshot_download...")
+                        from huggingface_hub import snapshot_download
+                        snapshot_download(
+                            repo_id="JunhaoZhuang/FlashVSR",
+                            local_dir=model_path,
+                            cache_dir=str(CONTAINER_CACHE_DIR / ".hf_hub_cache"),
+                            local_dir_use_symlinks=False
+                        )
+                        
+                        # Try to pull LFS files if they're still placeholders
+                        if os.path.exists(os.path.join(model_path, ".git")):
+                            subprocess.run(["git", "lfs", "pull"], cwd=model_path, timeout=300)
+                        
+                        print("Huggingface hub download successful")
+                        success = True
+                    except Exception as e:
+                        print(f"Huggingface hub download failed: {e}")
+                
+                if not success:
+                    raise RuntimeError("All download strategies failed")
+                
+                # Final verification
+                missing_files = check_files()
+                if missing_files:
+                    print(f"⚠️  Still missing files after download: {missing_files}")
+                    # List what we actually have
+                    if os.path.exists(model_path):
+                        print(f"Contents of {model_path}:")
+                        for item in os.listdir(model_path):
+                            item_path = os.path.join(model_path, item)
+                            if os.path.isfile(item_path):
+                                size = os.path.getsize(item_path)
+                                print(f"  {item}: {size} bytes")
+                else:
+                    print("✅ All model files downloaded successfully")
+                    # Show file sizes for verification
+                    for file in required_files:
+                        file_path = os.path.join(model_path, file)
+                        if os.path.exists(file_path):
+                            size = os.path.getsize(file_path)
+                            print(f"  {file}: {size:,} bytes")
+                    
+            except Exception as e:
+                print(f"Model download failed: {e}")
+                import traceback
+                traceback.print_exc()
+                # Create empty directory to prevent repeated download attempts
+                os.makedirs(model_path, exist_ok=True)
+        else:
+            print("✅ Model files already available")
+            # Show file sizes for verification
+            for file in required_files:
+                file_path = os.path.join(model_path, file)
+                if os.path.exists(file_path):
+                    size = os.path.getsize(file_path)
+                    print(f"  {file}: {size:,} bytes")
 
     def init_pipeline(self, model_type: str):
         """Initialize FlashVSR pipeline"""
@@ -315,12 +473,37 @@ class FlashVSRService:
             # Clear GPU memory before loading
             torch.cuda.empty_cache()
             
+            # Check if required model files exist
+            required_files = {
+                "diffusion_pytorch_model_streaming_dmd.safetensors": f"{self.model_path}/diffusion_pytorch_model_streaming_dmd.safetensors",
+                "LQ_proj_in.ckpt": f"{self.model_path}/LQ_proj_in.ckpt"
+            }
+            
+            if model_type == "full":
+                required_files["Wan2.1_VAE.pth"] = f"{self.model_path}/Wan2.1_VAE.pth"
+            else:  # tiny
+                required_files["TCDecoder.ckpt"] = f"{self.model_path}/TCDecoder.ckpt"
+            
+            missing_files = []
+            for name, path in required_files.items():
+                if not os.path.exists(path):
+                    missing_files.append(name)
+                else:
+                    size = os.path.getsize(path)
+                    print(f"Found {name}: {size} bytes")
+                    if size < 1000:  # Likely an LFS pointer file
+                        missing_files.append(f"{name} (LFS not pulled, size: {size})")
+            
+            if missing_files:
+                raise RuntimeError(f"Missing required model files: {missing_files}")
+            
+            print(f"Loading models from: {self.model_path}")
             mm = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
             
             if model_type == "tiny":
-                mm.load_models([
-                    f"{self.model_path}/diffusion_pytorch_model_streaming_dmd.safetensors",
-                ])
+                model_files = [f"{self.model_path}/diffusion_pytorch_model_streaming_dmd.safetensors"]
+                print(f"Loading tiny model files: {model_files}")
+                mm.load_models(model_files)
                 pipe = FlashVSRTinyPipeline.from_model_manager(mm, device="cuda")
                 
                 # Load TCDecoder for tiny model
@@ -330,11 +513,15 @@ class FlashVSRService:
                 if os.path.exists(tcdecoder_path):
                     mis = pipe.TCDecoder.load_state_dict(torch.load(tcdecoder_path), strict=False)
                     print(f"TCDecoder loaded: {mis}")
+                else:
+                    print(f"⚠️  TCDecoder not found at {tcdecoder_path}")
             else:  # full
-                mm.load_models([
+                model_files = [
                     f"{self.model_path}/diffusion_pytorch_model_streaming_dmd.safetensors",
                     f"{self.model_path}/Wan2.1_VAE.pth",
-                ])
+                ]
+                print(f"Loading full model files: {model_files}")
+                mm.load_models(model_files)
                 pipe = FlashVSRFullPipeline.from_model_manager(mm, device="cuda")
                 pipe.vae.model.encoder = None
                 pipe.vae.model.conv1 = None
@@ -344,6 +531,9 @@ class FlashVSRService:
             LQ_proj_in_path = f"{self.model_path}/LQ_proj_in.ckpt"
             if os.path.exists(LQ_proj_in_path):
                 pipe.denoising_model().LQ_proj_in.load_state_dict(torch.load(LQ_proj_in_path, map_location="cpu"), strict=True)
+                print("✅ LQ_proj_in loaded successfully")
+            else:
+                print(f"⚠️  LQ_proj_in not found at {LQ_proj_in_path}")
             pipe.denoising_model().LQ_proj_in.to('cuda')
 
             pipe.to('cuda')
