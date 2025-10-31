@@ -164,10 +164,10 @@ with flashvsr_image.imports():
             }[self]
 
     class FlashVSRRequest(BaseModel):
-        video_url: HttpUrl
+        url: HttpUrl
         model_type: Optional[ModelType] = Field(default=ModelType.FULL)
         output_format: Optional[OutputFormat] = Field(default=OutputFormat.MP4)
-        scale: Optional[int] = Field(default=4, ge=2, le=8)
+        scale: Optional[int] = Field(default=2, ge=2, le=8)
         seed: Optional[int] = Field(default=0)
         sparse_ratio: Optional[float] = Field(default=2.0, ge=1.0, le=3.0)
         local_range: Optional[int] = Field(default=11, ge=9, le=15)
@@ -565,8 +565,8 @@ class FlashVSRService:
         
         try:
             # Download input video
-            print(f"Downloading video from {request.video_url}")
-            temp_input_path = self.download_video(str(request.video_url))
+            print(f"Downloading video from {request.url}")
+            temp_input_path = self.download_video(str(request.url))
             
             # Initialize pipeline
             pipe = self.init_pipeline(request.model_type.value)
@@ -651,7 +651,7 @@ class FlashVSRService:
                 content=video_bytes,
                 media_type=request.output_format.mime_type,
                 headers={
-                    "Content-Disposition": f"attachment; filename=flashvsr_{request.model_type.value}_output.{request.output_format.value}",
+                    "Content-Disposition": f"attachment; filename=flashvsr_{request.model_type.value}_upscaled.{request.output_format.value}",
                     "X-Processing-Time": str(inference_time),
                     "X-Model-Type": request.model_type.value,
                     "X-Scale-Factor": str(request.scale),
