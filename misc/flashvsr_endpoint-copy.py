@@ -4,8 +4,15 @@
 
 # # FlashVSR Video Super-Resolution API on Modal
 
-# This implementation extracts the core FlashVSR functionality and makes it configurable
+# This implementation extracts the core FlashVSR v1.1 functionality and makes it configurable
 # instead of using the hardcoded inference scripts.
+# 
+# v1.1 Updates:
+# - Uses Causal_LQ4x_Proj instead of Buffer_LQ4x_Proj for better causal processing
+# - Improved scale factor handling (supports float scales)
+# - Better validation for scaled dimensions
+# - Explicit tiled parameter documentation for full model
+# - More efficient tensor conversion using np.asarray
 
 from __future__ import annotations
 
@@ -117,7 +124,7 @@ with flashvsr_image.imports():
         )
         utils_module = importlib.util.module_from_spec(utils_spec)
         utils_spec.loader.exec_module(utils_module)
-        Buffer_LQ4x_Proj = utils_module.Buffer_LQ4x_Proj
+        Causal_LQ4x_Proj = utils_module.Causal_LQ4x_Proj  # v1.1 uses Causal_LQ4x_Proj instead of Buffer_LQ4x_Proj
         
         # Import TCDecoder
         tcdecoder_spec = importlib.util.spec_from_file_location(
@@ -167,10 +174,10 @@ with flashvsr_image.imports():
         url: HttpUrl
         model_type: Optional[ModelType] = Field(default=ModelType.FULL)
         output_format: Optional[OutputFormat] = Field(default=OutputFormat.MP4)
-        scale: Optional[int] = Field(default=2, ge=2, le=8)
+        scale: Optional[int] = Field(default=2, ge=2, le=8)  # v1.1 supports float scales internally
         seed: Optional[int] = Field(default=0)
-        sparse_ratio: Optional[float] = Field(default=2.0, ge=1.0, le=3.0)
-        local_range: Optional[int] = Field(default=11, ge=9, le=15)
+        sparse_ratio: Optional[float] = Field(default=2.0, ge=1.0, le=3.0)  # v1.1 recommends 1.5 or 2.0
+        local_range: Optional[int] = Field(default=11, ge=9, le=15)  # v1.1 recommends 9 (sharper) or 11 (more stable)
         max_frames: Optional[int] = Field(default=None, ge=1, le=1000)
 
     # FlashVSR utility functions (extracted from their scripts)
@@ -184,9 +191,8 @@ with flashvsr_image.imports():
         return 0 if n < 1 else ((n - 1)//8)*8 + 1
 
     def pil_to_tensor_neg1_1(img: Image.Image, dtype=torch.bfloat16, device='cuda'):
-        # Convert PIL to numpy array and make a copy to avoid the non-writable tensor warning
-        img_array = np.array(img, dtype=np.uint8).copy()
-        t = torch.from_numpy(img_array).to(device=device, dtype=torch.float32)  # HWC
+        # v1.1 uses np.asarray instead of np.array for better memory efficiency
+        t = torch.from_numpy(np.asarray(img, np.uint8)).to(device=device, dtype=torch.float32)  # HWC
         t = t.permute(2,0,1) / 255.0 * 2.0 - 1.0  # CHW in [-1,1]
         return t.to(dtype)
 
@@ -200,17 +206,33 @@ with flashvsr_image.imports():
     def compute_scaled_and_target_dims(w0: int, h0: int, scale: int = 4, multiple: int = 128):
         if w0 <= 0 or h0 <= 0:
             raise ValueError("invalid original size")
-        sW, sH = w0 * scale, h0 * scale
-        tW = max(multiple, (sW // multiple) * multiple)
-        tH = max(multiple, (sH // multiple) * multiple)
+        # v1.1 supports float scale for more flexibility
+        sW = int(round(w0 * scale))
+        sH = int(round(h0 * scale))
+        tW = (sW // multiple) * multiple
+        tH = (sH // multiple) * multiple
+        # v1.1 adds validation for zero dimensions
+        if tW == 0 or tH == 0:
+            raise ValueError(
+                f"Scaled size too small ({sW}x{sH}) for multiple={multiple}. "
+                f"Increase scale (got {scale})."
+            )
         return sW, sH, tW, tH
 
     def upscale_then_center_crop(img: Image.Image, scale: int, tW: int, tH: int) -> Image.Image:
         w0, h0 = img.size
-        sW, sH = w0 * scale, h0 * scale
+        # v1.1 supports float scale
+        sW = int(round(w0 * scale))
+        sH = int(round(h0 * scale))
+        # v1.1 adds validation
+        if tW > sW or tH > sH:
+            raise ValueError(
+                f"Target crop ({tW}x{tH}) exceeds scaled size ({sW}x{sH}). "
+                f"Increase scale."
+            )
         up = img.resize((sW, sH), Image.BICUBIC)
-        l = max(0, (sW - tW) // 2)
-        t = max(0, (sH - tH) // 2)
+        l = (sW - tW) // 2
+        t = (sH - tH) // 2
         return up.crop((l, t, l + tW, t + tH))
 
     def prepare_input_tensor(video_path: str, scale: int = 4, dtype=torch.bfloat16, device='cuda', max_frames=None):
@@ -317,6 +339,7 @@ class FlashVSRService:
         model_path = self.model_path
         
         # Check if all required files exist and are not LFS placeholders
+        # v1.1 model files (same as v1.0 but with updated inference code)
         required_files = [
             "diffusion_pytorch_model_streaming_dmd.safetensors",
             "LQ_proj_in.ckpt", 
@@ -520,8 +543,8 @@ class FlashVSRService:
                 pipe.vae.model.encoder = None
                 pipe.vae.model.conv1 = None
 
-            # Common setup
-            pipe.denoising_model().LQ_proj_in = Buffer_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to("cuda", dtype=torch.bfloat16)
+            # Common setup - v1.1 uses Causal_LQ4x_Proj instead of Buffer_LQ4x_Proj
+            pipe.denoising_model().LQ_proj_in = Causal_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to("cuda", dtype=torch.bfloat16)
             LQ_proj_in_path = f"{self.model_path}/LQ_proj_in.ckpt"
             if os.path.exists(LQ_proj_in_path):
                 pipe.denoising_model().LQ_proj_in.load_state_dict(torch.load(LQ_proj_in_path, map_location="cpu"), strict=True)
@@ -590,11 +613,11 @@ class FlashVSRService:
             
             print(f"Running FlashVSR {request.model_type.value} inference...")
             
-            # Run inference
+            # Run inference - v1.1 inference parameters
             try:
                 if FLASHVSR_AVAILABLE and hasattr(pipe, 'denoising_model'):
-                    # Real FlashVSR inference
                     if request.model_type.value == "tiny":
+                        # v1.1 tiny model inference (no tiled parameter)
                         video = pipe(
                             prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=request.seed,
                             LQ_video=LQ, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
@@ -604,9 +627,12 @@ class FlashVSRService:
                             color_fix=True,
                         )
                     else:  # full
+                        # v1.1 full model inference with tiled parameter
+                        # tiled=False: faster inference but higher VRAM usage
+                        # tiled=True: lower memory consumption at the cost of speed
                         video = pipe(
                             prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=request.seed,
-                            tiled=False,  # Disable tiling for faster inference
+                            tiled=False,  # v1.1 explicitly documents this parameter
                             LQ_video=LQ, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
                             topk_ratio=request.sparse_ratio*768*1280/(th*tw), 
                             kv_ratio=3.0,
