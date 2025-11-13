@@ -2,7 +2,7 @@
 # lambda-test: false
 # ---
 
-# # FlashVSR Video Super-Resolution API on Modal
+# # FlashVSR-v1.1 Video Super-Resolution API on Modal
 
 # This implementation extracts the core FlashVSR v1.1 functionality and makes it configurable
 # instead of using the hardcoded inference scripts.
@@ -24,10 +24,10 @@ import modal
 
 # Container mount directories
 CONTAINER_CACHE_DIR = Path("/cache")
-CONTAINER_CACHE_VOLUME = modal.Volume.from_name("flashvsr_endpoint_2", create_if_missing=True)
+CONTAINER_CACHE_VOLUME = modal.Volume.from_name("flashvsr_endpoint", create_if_missing=True)
 
-# Build FlashVSR environment following official setup
-cuda_version = "12.4.1"  # Updated to match FlashVSR requirements
+# Build FlashVSR-v1.1 environment following official setup
+cuda_version = "12.4.1"  # Updated to match FlashVSR-v1.1 requirements
 flavor = "devel"
 operating_system = "ubuntu22.04"
 tag = f"{cuda_version}-{flavor}-{operating_system}"
@@ -383,7 +383,7 @@ class FlashVSRService:
                     print("Trying git lfs clone...")
                     result = subprocess.run([
                         "git", "lfs", "clone", 
-                        "https://huggingface.co/JunhaoZhuang/FlashVSR",
+                        "https://huggingface.co/JunhaoZhuang/FlashVSR-v1.1",
                         model_path
                     ], cwd=str(CONTAINER_CACHE_DIR), capture_output=True, text=True, timeout=300)
                     
@@ -401,7 +401,7 @@ class FlashVSRService:
                         print("Trying regular git clone + lfs pull...")
                         subprocess.run([
                             "git", "clone", 
-                            "https://huggingface.co/JunhaoZhuang/FlashVSR", 
+                            "https://huggingface.co/JunhaoZhuang/FlashVSR-v1.1", 
                             model_path
                         ], cwd=str(CONTAINER_CACHE_DIR), check=True, timeout=120)
                         
@@ -420,7 +420,7 @@ class FlashVSRService:
                         print("Trying huggingface_hub snapshot_download...")
                         from huggingface_hub import snapshot_download
                         snapshot_download(
-                            repo_id="JunhaoZhuang/FlashVSR",
+                            repo_id="JunhaoZhuang/FlashVSR-v1.1",
                             local_dir=model_path,
                             cache_dir=str(CONTAINER_CACHE_DIR / ".hf_hub_cache"),
                             local_dir_use_symlinks=False
@@ -475,14 +475,14 @@ class FlashVSRService:
                     print(f"  {file}: {size:,} bytes")
 
     def init_pipeline(self, model_type: str):
-        """Initialize FlashVSR pipeline"""
+        """Initialize FlashVSR-v1.1 pipeline"""
         if model_type in self.pipelines:
             return self.pipelines[model_type]
         
         print(f"Initializing {model_type} pipeline...")
         
         if not FLASHVSR_AVAILABLE:
-            raise RuntimeError("FlashVSR is not available. Please check the installation logs.")
+            raise RuntimeError("FlashVSR-v1.1 is not available. Please check the installation logs.")
         
         print(torch.cuda.current_device(), torch.cuda.get_device_name(torch.cuda.current_device()))
         
@@ -559,12 +559,12 @@ class FlashVSRService:
             pipe.load_models_to_device(["dit","vae"])
             
         except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
-            print(f"Failed to initialize FlashVSR pipeline (likely OOM): {e}")
+            print(f"Failed to initialize FlashVSR-v1.1 pipeline (likely OOM): {e}")
             torch.cuda.empty_cache()
-            raise RuntimeError(f"FlashVSR pipeline initialization failed: {e}")
+            raise RuntimeError(f"FlashVSR-v1.1 pipeline initialization failed: {e}")
         except Exception as e:
-            print(f"Failed to initialize FlashVSR pipeline: {e}")
-            raise RuntimeError(f"FlashVSR pipeline initialization failed: {e}")
+            print(f"Failed to initialize FlashVSR-v1.1 pipeline: {e}")
+            raise RuntimeError(f"FlashVSR-v1.1 pipeline initialization failed: {e}")
         
         self.pipelines[model_type] = pipe
         print(f"{model_type} pipeline initialized")
@@ -611,7 +611,7 @@ class FlashVSRService:
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
             
-            print(f"Running FlashVSR {request.model_type.value} inference...")
+            print(f"Running FlashVSR-v1.1 {request.model_type.value} inference...")
             
             # Run inference - v1.1 inference parameters
             try:
@@ -642,15 +642,15 @@ class FlashVSRService:
                 else:
                     raise RuntimeError("Using fallback inference")
             except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
-                print(f"FlashVSR inference failed (likely OOM): {e}")
+                print(f"FlashVSR-v1.1 inference failed (likely OOM): {e}")
                 torch.cuda.empty_cache()
-                raise HTTPException(status_code=500, detail=f"FlashVSR inference failed due to memory constraints: {e}")
+                raise HTTPException(status_code=500, detail=f"FlashVSR-v1.1 inference failed due to memory constraints: {e}")
             except Exception as e:
-                print(f"FlashVSR inference failed: {e}")
-                raise HTTPException(status_code=500, detail=f"FlashVSR inference failed: {e}")
+                print(f"FlashVSR-v1.1 inference failed: {e}")
+                raise HTTPException(status_code=500, detail=f"FlashVSR-v1.1 inference failed: {e}")
             
             inference_time = time.time() - start_time
-            print(f"FlashVSR inference completed in {inference_time:.2f}s")
+            print(f"FlashVSR-v1.1 inference completed in {inference_time:.2f}s")
             
             # Convert to video frames
             video_frames = tensor2video(video)
