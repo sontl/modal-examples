@@ -318,7 +318,7 @@ class FlashVSRService:
         print("Setting up FlashVSR...")
         
         # Download model weights using Git LFS (as per FlashVSR documentation)
-        model_path = str(CONTAINER_CACHE_DIR / "FlashVSR")
+        model_path = str(CONTAINER_CACHE_DIR / "FlashVSR-v1.1")
         self.model_path = model_path
         
         # Always try to ensure model files are available
