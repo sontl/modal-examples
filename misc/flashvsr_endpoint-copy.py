@@ -135,7 +135,7 @@ with flashvsr_image.imports():
         build_tcdecoder = tcdecoder_module.build_tcdecoder
         
         # Import diffsynth (available from pip install)
-        from diffsynth import ModelManager, FlashVSRTinyPipeline, FlashVSRFullPipeline
+        from diffsynth import ModelManager, FlashVSRTinyPipeline, FlashVSRFullPipeline, FlashVSRTinyLongPipeline
         
         FLASHVSR_AVAILABLE = True
         print("✅ FlashVSR imported successfully")
@@ -156,6 +156,7 @@ with flashvsr_image.imports():
     class ModelType(Enum):
         FULL = "full"
         TINY = "tiny"
+        TINY_LONG = "tiny_long"  # For longer videos with lower VRAM usage
 
     class OutputFormat(Enum):
         MP4 = "mp4"
@@ -179,6 +180,7 @@ with flashvsr_image.imports():
         sparse_ratio: Optional[float] = Field(default=2.0, ge=1.0, le=3.0)  # v1.1 recommends 1.5 or 2.0
         local_range: Optional[int] = Field(default=11, ge=9, le=15)  # v1.1 recommends 9 (sharper) or 11 (more stable)
         max_frames: Optional[int] = Field(default=None, ge=1, le=1000)
+        tiled: Optional[bool] = Field(default=False)  # Full model only: True for lower VRAM, False for faster inference
 
     # FlashVSR utility functions (extracted from their scripts)
     def tensor2video(frames):
@@ -235,7 +237,7 @@ with flashvsr_image.imports():
         t = (sH - tH) // 2
         return up.crop((l, t, l + tW, t + tH))
 
-    def prepare_input_tensor(video_path: str, scale: int = 4, dtype=torch.bfloat16, device='cuda', max_frames=None):
+    def prepare_input_tensor(video_path: str, scale: int = 4, dtype=torch.bfloat16, device='cuda', max_frames=None, load_to_cpu=False):
         """Prepare video input tensor from video file"""
         rdr = imageio.get_reader(video_path)
         first = Image.fromarray(rdr.get_data(0)).convert('RGB')
@@ -287,12 +289,15 @@ with flashvsr_image.imports():
         idx = idx[:F]
         print(f"Target Frames (8n-3): {F-4}")
 
+        # For long videos, load to CPU to reduce VRAM usage
+        tensor_device = 'cpu' if load_to_cpu else device
+        
         frames = []
         try:
             for i in idx:
                 img = Image.fromarray(rdr.get_data(i)).convert('RGB')
                 img_out = upscale_then_center_crop(img, scale=scale, tW=tW, tH=tH)
-                frames.append(pil_to_tensor_neg1_1(img_out, dtype, device))
+                frames.append(pil_to_tensor_neg1_1(img_out, dtype, tensor_device))
         finally:
             try:
                 rdr.close()
@@ -498,7 +503,7 @@ class FlashVSRService:
             
             if model_type == "full":
                 required_files["Wan2.1_VAE.pth"] = f"{self.model_path}/Wan2.1_VAE.pth"
-            else:  # tiny
+            else:  # tiny or tiny_long
                 required_files["TCDecoder.ckpt"] = f"{self.model_path}/TCDecoder.ckpt"
             
             missing_files = []
@@ -524,6 +529,22 @@ class FlashVSRService:
                 pipe = FlashVSRTinyPipeline.from_model_manager(mm, device="cuda")
                 
                 # Load TCDecoder for tiny model
+                multi_scale_channels = [512, 256, 128, 128]
+                pipe.TCDecoder = build_tcdecoder(new_channels=multi_scale_channels, new_latent_channels=16+768)
+                tcdecoder_path = f"{self.model_path}/TCDecoder.ckpt"
+                if os.path.exists(tcdecoder_path):
+                    mis = pipe.TCDecoder.load_state_dict(torch.load(tcdecoder_path), strict=False)
+                    print(f"TCDecoder loaded: {mis}")
+                else:
+                    print(f"⚠️  TCDecoder not found at {tcdecoder_path}")
+            elif model_type == "tiny_long":
+                # Tiny Long model for longer videos with lower VRAM usage
+                model_files = [f"{self.model_path}/diffusion_pytorch_model_streaming_dmd.safetensors"]
+                print(f"Loading tiny_long model files: {model_files}")
+                mm.load_models(model_files)
+                pipe = FlashVSRTinyLongPipeline.from_model_manager(mm, device="cuda")
+                
+                # Load TCDecoder for tiny_long model
                 multi_scale_channels = [512, 256, 128, 128]
                 pipe.TCDecoder = build_tcdecoder(new_channels=multi_scale_channels, new_latent_channels=16+768)
                 tcdecoder_path = f"{self.model_path}/TCDecoder.ckpt"
@@ -598,12 +619,15 @@ class FlashVSRService:
             print("Preparing input tensor...")
             # Use float32 for fallback, bfloat16 for real FlashVSR
             input_dtype = torch.float32 if not FLASHVSR_AVAILABLE else torch.bfloat16
+            # For tiny_long, load tensors to CPU to reduce VRAM usage for longer videos
+            load_to_cpu = request.model_type.value == "tiny_long"
             LQ, th, tw, F, fps = prepare_input_tensor(
                 temp_input_path, 
                 scale=request.scale, 
                 dtype=input_dtype, 
                 device='cuda',
-                max_frames=request.max_frames
+                max_frames=request.max_frames,
+                load_to_cpu=load_to_cpu
             )
             
             # Time the inference
@@ -626,13 +650,24 @@ class FlashVSRService:
                             local_range=request.local_range,
                             color_fix=True,
                         )
+                    elif request.model_type.value == "tiny_long":
+                        # v1.1 tiny_long model inference for longer videos
+                        # Input tensor is on CPU to reduce VRAM usage
+                        video = pipe(
+                            prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=request.seed,
+                            LQ_video=LQ, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
+                            topk_ratio=request.sparse_ratio*768*1280/(th*tw), 
+                            kv_ratio=3.0,
+                            local_range=request.local_range,
+                            color_fix=True,
+                        )
                     else:  # full
                         # v1.1 full model inference with tiled parameter
                         # tiled=False: faster inference but higher VRAM usage
                         # tiled=True: lower memory consumption at the cost of speed
                         video = pipe(
                             prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=request.seed,
-                            tiled=False,  # v1.1 explicitly documents this parameter
+                            tiled=request.tiled,
                             LQ_video=LQ, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
                             topk_ratio=request.sparse_ratio*768*1280/(th*tw), 
                             kv_ratio=3.0,
