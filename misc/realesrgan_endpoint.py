@@ -69,7 +69,7 @@ with realesrgan_image.imports():
     import requests
     import torch
     from basicsr.archs.rrdbnet_arch import RRDBNet
-    from fastapi import Response
+    from fastapi import HTTPException, Response
     from pydantic import BaseModel, Field
     from realesrgan import RealESRGANer
 
@@ -159,12 +159,39 @@ class RealESRGANService:
                 print(f"Downloaded {filename}")
 
     def _load_image_from_url(self, url: str) -> np.ndarray:
+        from fastapi import HTTPException
+        from urllib.parse import urlparse
+        
+        # Check URL extension for non-image formats
+        parsed_url = urlparse(url)
+        path_lower = parsed_url.path.lower()
+        video_extensions = ('.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv', '.m4v')
+        image_extensions = ('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif')
+        
+        if path_lower.endswith(video_extensions):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Video files are not supported. Please provide an image URL (supported formats: {', '.join(image_extensions)})"
+            )
+        
         response = requests.get(url, timeout=30)
         response.raise_for_status()
+        
+        # Check content-type header
+        content_type = response.headers.get('content-type', '').lower()
+        if content_type.startswith('video/'):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Video files are not supported (content-type: {content_type}). Please provide an image URL."
+            )
+        
         img_array = np.frombuffer(response.content, np.uint8)
         img = cv2.imdecode(img_array, cv2.IMREAD_UNCHANGED)
         if img is None:
-            raise ValueError("Failed to decode image from URL")
+            raise HTTPException(
+                status_code=400,
+                detail="Failed to decode image from URL. Please ensure the URL points to a valid image file."
+            )
         return img
 
     @modal.fastapi_endpoint(method="POST", docs=True)
