@@ -635,7 +635,6 @@ class FlashVSRService:
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
             
-            print(f"Running FlashVSR-v1.1 {request.model_type.value} inference...")
             
             # Run inference - v1.1 inference parameters
             try:
@@ -643,6 +642,11 @@ class FlashVSRService:
                     # All model types support tiled parameter
                     # tiled=False: faster inference but higher VRAM usage
                     # tiled=True: lower memory consumption at the cost of speed
+                    # print if using Tiled
+                    if request.tiled:
+                        print(f"Running FlashVSR-v1.1 {request.model_type.value} inference with Tiled...")
+                    else:
+                        print(f"Running FlashVSR-v1.1 {request.model_type.value} inference...")
                     video = pipe(
                         prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=request.seed,
                         tiled=request.tiled,
