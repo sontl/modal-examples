@@ -640,40 +640,18 @@ class FlashVSRService:
             # Run inference - v1.1 inference parameters
             try:
                 if FLASHVSR_AVAILABLE and hasattr(pipe, 'denoising_model'):
-                    if request.model_type.value == "tiny":
-                        # v1.1 tiny model inference (no tiled parameter)
-                        video = pipe(
-                            prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=request.seed,
-                            LQ_video=LQ, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
-                            topk_ratio=request.sparse_ratio*768*1280/(th*tw), 
-                            kv_ratio=3.0,
-                            local_range=request.local_range,
-                            color_fix=True,
-                        )
-                    elif request.model_type.value == "tiny_long":
-                        # v1.1 tiny_long model inference for longer videos
-                        # Input tensor is on CPU to reduce VRAM usage
-                        video = pipe(
-                            prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=request.seed,
-                            LQ_video=LQ, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
-                            topk_ratio=request.sparse_ratio*768*1280/(th*tw), 
-                            kv_ratio=3.0,
-                            local_range=request.local_range,
-                            color_fix=True,
-                        )
-                    else:  # full
-                        # v1.1 full model inference with tiled parameter
-                        # tiled=False: faster inference but higher VRAM usage
-                        # tiled=True: lower memory consumption at the cost of speed
-                        video = pipe(
-                            prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=request.seed,
-                            tiled=request.tiled,
-                            LQ_video=LQ, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
-                            topk_ratio=request.sparse_ratio*768*1280/(th*tw), 
-                            kv_ratio=3.0,
-                            local_range=request.local_range,
-                            color_fix=True,
-                        )
+                    # All model types support tiled parameter
+                    # tiled=False: faster inference but higher VRAM usage
+                    # tiled=True: lower memory consumption at the cost of speed
+                    video = pipe(
+                        prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=request.seed,
+                        tiled=request.tiled,
+                        LQ_video=LQ, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
+                        topk_ratio=request.sparse_ratio*768*1280/(th*tw), 
+                        kv_ratio=3.0,
+                        local_range=request.local_range,
+                        color_fix=True,
+                    )
                 else:
                     raise RuntimeError("Using fallback inference")
             except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
