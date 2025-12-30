@@ -119,10 +119,13 @@ with video2x_image.imports():
         CONTAINER_CACHE_DIR: CONTAINER_CACHE_VOLUME,
     },
     timeout=3600,
+    scaledown_window=20,  # 20 seconds
+    enable_memory_snapshot=True,
+    experimental_options={"enable_gpu_snapshot": True},
 )
 class Video2XService:
     
-    @modal.enter()
+    @modal.enter(snap=True)
     def check_installation(self):
         """Verify Video2X is installed and configure Vulkan at runtime."""
         import subprocess
