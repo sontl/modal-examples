@@ -123,6 +123,7 @@ with video2x_image.imports():
     enable_memory_snapshot=True,
     experimental_options={"enable_gpu_snapshot": True},
 )
+@modal.concurrent(max_inputs=26, target_inputs=22)  # Allow a 20% burst
 class Video2XService:
     
     @modal.enter(snap=True)
