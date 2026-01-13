@@ -106,7 +106,7 @@ with video2x_image.imports():
         processor: str = Field(default="realesrgan", description="Upscaling processor (realesrgan, libplacebo)")
         model: str = Field(default="realesr-animevideov3", description="RealESRGAN model to use")
         codec: str = Field(default="libx264", description="Output video codec")
-        preset: str = Field(default="slow", description="Encoder preset (ultrafast, fast, medium, slow, etc.)")
+        preset: str = Field(default="medium", description="Encoder preset (ultrafast, fast, medium, slow, etc.)")
         crf: int = Field(default=20, description="Constant Rate Factor (0-51, lower = better quality)")
         log_level: str = Field(default="info", description="Video2X log level")
         process_timeout: int = Field(default=1800, description="Timeout for processing in seconds")
