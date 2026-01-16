@@ -149,20 +149,36 @@ class FluxKlein9BService:
     # ## Model loading and optimization
 
     @modal.enter(snap=True)
-    def load(self):
-        print("Loading Flux Klein 9B pipeline...")
+    def load_to_cpu(self):
+        """Load model weights to CPU memory for snapshotting.
+        
+        This runs during the CPU memory snapshot phase when no GPU is available.
+        The weights are loaded to CPU and will be snapshotted for faster cold starts.
+        """
+        print("Loading Flux Klein 9B pipeline to CPU...")
         
         # Load the pipeline with bfloat16 for optimal performance
+        # Keep on CPU during snapshot phase - GPU is not available yet
         self.pipeline = Flux2KleinPipeline.from_pretrained(
             "black-forest-labs/FLUX.2-klein-9B",
             torch_dtype=torch.bfloat16,
             cache_dir=CONTAINER_CACHE_DIR
         )
         
-        # Move model to GPU (L40S has 48GB VRAM which should handle 9B model in bfloat16)
+        print("Pipeline loaded to CPU. Ready for memory snapshot.")
+
+    @modal.enter(snap=False)
+    def move_to_gpu(self):
+        """Move the model to GPU after GPU is attached.
+        
+        This runs after the container restores from snapshot and a GPU is available.
+        """
+        print("Moving pipeline to GPU...")
+        
+        # Now we can safely move to GPU as the GPU is attached
         self.pipeline.to("cuda")
         
-        print("Pipeline loaded and optimized. Ready for memory snapshot.")
+        print("Pipeline moved to GPU. Ready for inference.")
 
     # ## The main inference endpoint
 
