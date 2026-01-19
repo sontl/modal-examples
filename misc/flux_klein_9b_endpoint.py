@@ -86,8 +86,9 @@ app = modal.App("flux_klein_9b_endpoint", image=flux_klein_image)
 
 with flux_klein_image.imports():
     import time
+    import base64
     from enum import Enum
-    from typing import Optional
+    from typing import Optional, Union, List
     import torch
     from diffusers import Flux2KleinPipeline
     from pydantic import BaseModel, Field
@@ -115,6 +116,7 @@ with flux_klein_image.imports():
 
     class ImageGenerationRequest(BaseModel):
         prompt: str  # Text prompt for image generation
+        image: Optional[Union[str, List[str]]] = None # Base64 encoded image(s) for image-to-image generation
         height: Optional[int] = Field(default=1024, ge=512, le=2048, multiple_of=64)
         width: Optional[int] = Field(default=1024, ge=512, le=2048, multiple_of=64)
         num_inference_steps: Optional[int] = Field(default=4, ge=1, le=50)  # Klein uses 4 steps by default
@@ -122,6 +124,10 @@ with flux_klein_image.imports():
         seed: Optional[int] = None
         output_format: Optional[OutputFormat] = Field(default=OutputFormat.JPEG)
         output_quality: Optional[int] = Field(default=90, ge=1, le=100)
+
+    def decode_base64_image(image_str: str) -> Image.Image:
+        image_bytes = base64.b64decode(image_str)
+        return Image.open(BytesIO(image_bytes)).convert("RGB")
 
 # ## The FluxKlein9BService class
 
@@ -201,6 +207,13 @@ class FluxKlein9BService:
         
         if generator is not None:
             inputs["generator"] = generator
+
+        # Handle image input for image-to-image generation
+        if request.image:
+            if isinstance(request.image, list):
+                inputs["image"] = [decode_base64_image(img) for img in request.image]
+            else:
+                inputs["image"] = decode_base64_image(request.image)
 
         # Time the inference
         torch.cuda.synchronize()
