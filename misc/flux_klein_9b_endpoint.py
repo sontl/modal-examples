@@ -136,8 +136,7 @@ with flux_klein_image.imports():
 # configure auto-scaling parameters, the GPU type, and necessary secrets.
 
 
-# Common configuration for both services
-common_config = dict(
+@app.cls(
     secrets=[
         modal.Secret.from_name("huggingface-secret"),
     ],
@@ -147,15 +146,12 @@ common_config = dict(
     },
     min_containers=0,
     buffer_containers=0,
+    scaledown_window=2,
     timeout=3600,
     enable_memory_snapshot=True,
     # experimental_options={"enable_gpu_snapshot": True},  # Temporarily disabled
 )
-
-
-class FluxKleinBase:
-    """Base class containing common logic for Flux Klein services."""
-
+class FluxKlein9BService:
     # ## Model loading and optimization
 
     @modal.enter(snap=True)
@@ -247,24 +243,6 @@ class FluxKleinBase:
             content=image_bytes,
             media_type=request.output_format.mime_type
         )
-
-
-@app.cls(
-    scaledown_window=2,
-    **common_config,
-)
-class FluxKlein9BService(FluxKleinBase):
-    """Standard service with aggressive scaledown (2s) for cost savings."""
-    pass
-
-
-@app.cls(
-    scaledown_window=10,
-    **common_config,
-)
-class FluxKlein9BBatchService(FluxKleinBase):
-    """Batch-optimized service with longer scaledown (10s) for burst requests."""
-    pass
 
 
 # ## Local testing
