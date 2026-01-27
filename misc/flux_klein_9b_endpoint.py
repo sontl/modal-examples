@@ -129,14 +129,10 @@ with flux_klein_image.imports():
         image_bytes = base64.b64decode(image_str)
         return Image.open(BytesIO(image_bytes)).convert("RGB")
 
-# ## The FluxKlein9BService class
+# ## Common configuration for all Flux Klein 9B services
 
-# This class handles model loading, optimization, and inference. We use Modal's
-# class decorator to control the lifecycle of our cloud container as well as to
-# configure auto-scaling parameters, the GPU type, and necessary secrets.
-
-
-@app.cls(
+# Shared configuration dict to avoid repetition across service classes.
+common_config = dict(
     secrets=[
         modal.Secret.from_name("huggingface-secret"),
     ],
@@ -146,13 +142,19 @@ with flux_klein_image.imports():
     },
     min_containers=0,
     buffer_containers=0,
-    scaledown_window=2,
     timeout=3600,
     enable_memory_snapshot=True,
     # experimental_options={"enable_gpu_snapshot": True},  # Temporarily disabled
 )
-class FluxKlein9BService:
-    # ## Model loading and optimization
+
+
+# ## FluxKleinBase class
+
+# This base class handles model loading, optimization, and inference.
+# Subclasses inherit all the logic and only differ in their scaledown_window.
+
+class FluxKleinBase:
+    """Base class containing all shared logic for Flux Klein 9B inference."""
 
     @modal.enter(snap=True)
     def load_to_cpu(self):
@@ -243,6 +245,26 @@ class FluxKlein9BService:
             content=image_bytes,
             media_type=request.output_format.mime_type
         )
+
+
+# ## Service classes with different scaledown windows
+
+@app.cls(
+    scaledown_window=2,  # Aggressive scaledown for cost savings
+    **common_config,
+)
+class FluxKlein9BService(FluxKleinBase):
+    """Standard service with aggressive scaledown (2s) for cost savings."""
+    pass
+
+
+@app.cls(
+    scaledown_window=10,  # Longer scaledown for burst requests
+    **common_config,
+)
+class FluxKlein9BBatchService(FluxKleinBase):
+    """Batch-optimized service with longer scaledown (10s) for burst requests."""
+    pass
 
 
 # ## Local testing
