@@ -166,32 +166,51 @@ common_config = dict(
     min_containers=0,
     buffer_containers=0,
     timeout=600,  # 10 minutes timeout for long audio files
-    # Note: memory snapshot is disabled for AudioSR because the library's internal
-    # torch.load doesn't support the CPU->GPU migration pattern needed for snapshotting
+    enable_memory_snapshot=True,  # Snapshot model loaded on CPU for faster cold starts
 )
 
 
 # ## AudioSR Service Class
 
 @app.cls(
-    scaledown_window=2,  # Keep warm for 60 seconds for follow-up requests
-    gpu="T4",  # T4 is sufficient for AudioSR
+    scaledown_window=2,  # Quick scaledown for cost savings
+    gpu="L4",  # L4 for faster processing (upgrade from T4)
     **common_config,
 )
 class AudioSRService:
     """Audio super-resolution service using AudioSR."""
 
-    @modal.enter()
-    def load_model(self):
-        """Load AudioSR model on container start."""
-        print("Loading AudioSR basic model...")
+    @modal.enter(snap=True)
+    def load_model_to_cpu(self):
+        """Load AudioSR model to CPU during snapshot phase.
+        
+        During snapshotting, no GPU is available. We load the model to CPU,
+        and the model weights will be included in the memory snapshot.
+        """
+        print("Loading AudioSR model to CPU for snapshotting...")
         
         # Ensure temp directory exists
         CONTAINER_TEMP_DIR.mkdir(parents=True, exist_ok=True)
         
-        # Load the basic model on GPU
-        self.audiosr_model = audiosr.build_model(model_name="basic", device="cuda")
-        print("AudioSR basic model loaded successfully.")
+        # Load model to CPU - this will be snapshotted
+        self.audiosr_model = audiosr.build_model(model_name="basic", device="cpu")
+        print("AudioSR model loaded to CPU. Ready for snapshot.")
+
+    @modal.enter(snap=False)
+    def move_model_to_gpu(self):
+        """Move the pre-loaded model to GPU after snapshot restore.
+        
+        After restoring from snapshot, the GPU is available. We just move
+        the already-loaded model to CUDA - no need to rebuild.
+        """
+        import torch
+        print("Moving AudioSR model to CUDA...")
+        
+        # Move the model to GPU (it's already loaded from snapshot)
+        self.audiosr_model = self.audiosr_model.to("cuda")
+        self.audiosr_model.device = torch.device("cuda")
+        
+        print("AudioSR model moved to CUDA. Ready for inference.")
 
     def _download_audio(self, url: str, output_path: Path) -> None:
         """Download audio file from URL."""
