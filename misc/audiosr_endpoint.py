@@ -387,7 +387,14 @@ class AudioSRService:
                     latent_t_per_second=12.8
                 )
                 # AudioSR returns shape (1, channels, samples) - we want mono so take first channel
-                return waveform[0, 0, :]  # Shape: (samples,)
+                upscaled = waveform[0, 0, :]  # Shape: (samples,)
+                
+                # Trim to expected output duration (AudioSR pads internally)
+                expected_output_samples = int(duration * output_sr)
+                if len(upscaled) > expected_output_samples:
+                    upscaled = upscaled[:expected_output_samples]
+                
+                return upscaled
             finally:
                 if temp_path.exists():
                     temp_path.unlink()
@@ -395,23 +402,30 @@ class AudioSRService:
         # For long audio, process in chunks
         print(f"Channel {channel_idx + 1}: Processing in {chunk_duration}s chunks...")
         
-        # Calculate chunk parameters in samples
+        # Calculate chunk parameters in samples (input sample rate)
         chunk_samples = int(chunk_duration * sr)
         overlap_samples = int(overlap_duration * sr)
         step_samples = chunk_samples - overlap_samples
         
-        # Calculate output overlap in samples (at output sample rate)
+        # Calculate output parameters (output sample rate = 48kHz)
+        output_chunk_samples = int(chunk_duration * output_sr)
         output_overlap_samples = int(overlap_duration * output_sr)
+        output_step_samples = output_chunk_samples - output_overlap_samples
+        
+        # Calculate expected total output length
+        expected_output_total = int(duration * output_sr)
         
         # Process chunks
         chunks_upscaled = []
+        chunk_infos = []  # Store info about each chunk for proper trimming
         total_chunks = (len(channel_data) - overlap_samples) // step_samples + 1
         
         for i, start in enumerate(range(0, len(channel_data) - overlap_samples, step_samples)):
             end = min(start + chunk_samples, len(channel_data))
             chunk = channel_data[start:end]
+            chunk_input_duration = len(chunk) / sr
             
-            print(f"  Chunk {i+1}/{total_chunks} ({start/sr:.2f}s - {end/sr:.2f}s)...")
+            print(f"  Chunk {i+1}/{total_chunks} ({start/sr:.2f}s - {end/sr:.2f}s, duration={chunk_input_duration:.2f}s)...")
             
             # Save chunk to temporary file
             chunk_path = work_dir / f"channel_{channel_idx}_chunk_{i}.wav"
@@ -428,7 +442,22 @@ class AudioSRService:
                     latent_t_per_second=12.8
                 )
                 # Take first channel of output (mono)
-                chunks_upscaled.append(waveform[0, 0, :])  # Shape: (samples,)
+                upscaled_chunk = waveform[0, 0, :]  # Shape: (samples,)
+                
+                # Calculate expected output length for this chunk
+                expected_chunk_output = int(chunk_input_duration * output_sr)
+                
+                # Trim to expected length (remove AudioSR's internal padding)
+                if len(upscaled_chunk) > expected_chunk_output:
+                    upscaled_chunk = upscaled_chunk[:expected_chunk_output]
+                
+                chunks_upscaled.append(upscaled_chunk)
+                chunk_infos.append({
+                    'input_start': start,
+                    'input_end': end,
+                    'input_duration': chunk_input_duration,
+                    'output_length': len(upscaled_chunk)
+                })
             finally:
                 # Clean up chunk file
                 if chunk_path.exists():
@@ -438,29 +467,40 @@ class AudioSRService:
         print(f"  Concatenating {len(chunks_upscaled)} chunks for channel {channel_idx + 1}...")
         
         if len(chunks_upscaled) == 1:
-            return chunks_upscaled[0]
-        
-        # Create crossfade windows
-        fade_in = np.linspace(0, 1, output_overlap_samples)
-        fade_out = np.linspace(1, 0, output_overlap_samples)
-        
-        # Start with first chunk
-        final_audio = chunks_upscaled[0].copy()
-        
-        for i in range(1, len(chunks_upscaled)):
-            current_chunk = chunks_upscaled[i].copy()
+            final_audio = chunks_upscaled[0]
+        else:
+            # Create crossfade windows
+            fade_in = np.linspace(0, 1, output_overlap_samples)
+            fade_out = np.linspace(1, 0, output_overlap_samples)
             
-            # Apply crossfade
-            overlap_start = len(final_audio) - output_overlap_samples
-            final_audio[overlap_start:] *= fade_out
-            current_chunk[:output_overlap_samples] *= fade_in
+            # Start with first chunk
+            final_audio = chunks_upscaled[0].copy()
             
-            # Combine
-            final_audio = np.concatenate([
-                final_audio[:overlap_start],
-                final_audio[overlap_start:] + current_chunk[:output_overlap_samples],
-                current_chunk[output_overlap_samples:]
-            ])
+            for i in range(1, len(chunks_upscaled)):
+                current_chunk = chunks_upscaled[i].copy()
+                
+                # Ensure we have enough samples for crossfade
+                if len(final_audio) < output_overlap_samples or len(current_chunk) < output_overlap_samples:
+                    # Not enough for crossfade, just concatenate
+                    final_audio = np.concatenate([final_audio, current_chunk])
+                    continue
+                
+                # Apply crossfade
+                overlap_start = len(final_audio) - output_overlap_samples
+                final_audio[overlap_start:] *= fade_out
+                current_chunk[:output_overlap_samples] *= fade_in
+                
+                # Combine
+                final_audio = np.concatenate([
+                    final_audio[:overlap_start],
+                    final_audio[overlap_start:] + current_chunk[:output_overlap_samples],
+                    current_chunk[output_overlap_samples:]
+                ])
+        
+        # Trim final output to exact expected duration
+        if len(final_audio) > expected_output_total:
+            print(f"  Trimming output from {len(final_audio)/output_sr:.2f}s to {expected_output_total/output_sr:.2f}s")
+            final_audio = final_audio[:expected_output_total]
         
         return final_audio
 
