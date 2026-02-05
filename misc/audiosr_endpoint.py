@@ -121,6 +121,10 @@ with audiosr_image.imports():
             le=8,
             description="Number of poles for the low-pass filter"
         )
+        skip_lowpass: Optional[bool] = Field(
+            default=False,
+            description="Skip low-pass filtering (use when input already has clean cutoff pattern)"
+        )
 
         ddim_steps: Optional[int] = Field(
             default=50,
@@ -162,13 +166,15 @@ common_config = dict(
     min_containers=0,
     buffer_containers=0,
     timeout=600,  # 10 minutes timeout for long audio files
+    # Note: memory snapshot is disabled for AudioSR because the library's internal
+    # torch.load doesn't support the CPU->GPU migration pattern needed for snapshotting
 )
 
 
 # ## AudioSR Service Class
 
 @app.cls(
-    scaledown_window=60,  # Keep warm for 60 seconds for follow-up requests
+    scaledown_window=2,  # Keep warm for 60 seconds for follow-up requests
     gpu="T4",  # T4 is sufficient for AudioSR
     **common_config,
 )
@@ -183,8 +189,8 @@ class AudioSRService:
         # Ensure temp directory exists
         CONTAINER_TEMP_DIR.mkdir(parents=True, exist_ok=True)
         
-        # Load the basic model
-        self.audiosr_model = audiosr.build_model(model_name="basic")
+        # Load the basic model on GPU
+        self.audiosr_model = audiosr.build_model(model_name="basic", device="cuda")
         print("AudioSR basic model loaded successfully.")
 
     def _download_audio(self, url: str, output_path: Path) -> None:
@@ -246,6 +252,9 @@ class AudioSRService:
     ) -> dict:
         """Upscale audio using AudioSR with chunking for long files.
         
+        AudioSR processes mono audio internally. For stereo files, we process
+        each channel separately and merge them back to preserve stereo imaging.
+        
         AudioSR recommends max 5.12 seconds per chunk for best quality.
         For longer files, we split into chunks, process each, and concatenate.
         """
@@ -261,106 +270,58 @@ class AudioSRService:
         original_info = sf.info(str(input_path))
         original_sr = original_info.samplerate
         duration = original_info.duration
+        num_channels = original_info.channels
         
-        print(f"Audio duration: {duration:.2f}s, sample rate: {original_sr}Hz")
+        print(f"Audio duration: {duration:.2f}s, sample rate: {original_sr}Hz, channels: {num_channels}")
         
-        # If audio is short enough, process directly
-        if duration <= CHUNK_DURATION + 1.0:  # Add small buffer
-            print(f"Processing audio directly (duration <= {CHUNK_DURATION}s)...")
-            waveform = audiosr.super_resolution(
-                self.audiosr_model,
-                str(input_path),
-                seed=seed if seed is not None else 42,
-                guidance_scale=guidance_scale,
-                ddim_steps=ddim_steps,
-                latent_t_per_second=12.8
-            )
-            sf.write(str(output_path), waveform[0].T, OUTPUT_SR)
-            print(f"Upscaled audio saved to: {output_path}")
-            return {
-                "original_sample_rate": original_sr,
-                "output_sample_rate": OUTPUT_SR
-            }
-        
-        # For long audio, process in chunks
-        print(f"Audio is {duration:.2f}s, processing in {CHUNK_DURATION}s chunks...")
-        
-        # Load entire audio for chunking
+        # Load audio data
         audio_data, sr = sf.read(str(input_path))
+        
+        # Handle mono vs stereo
         if len(audio_data.shape) == 1:
-            audio_data = audio_data.reshape(-1, 1)  # Ensure 2D
-        
-        # Calculate chunk parameters in samples
-        chunk_samples = int(CHUNK_DURATION * sr)
-        overlap_samples = int(OVERLAP_DURATION * sr)
-        step_samples = chunk_samples - overlap_samples
-        
-        # Calculate output overlap in samples (at 48kHz)
-        output_overlap_samples = int(OVERLAP_DURATION * OUTPUT_SR)
-        
-        # Process chunks
-        chunks_upscaled = []
-        work_dir = input_path.parent
-        total_chunks = (len(audio_data) - overlap_samples) // step_samples + 1
-        
-        for i, start in enumerate(range(0, len(audio_data) - overlap_samples, step_samples)):
-            end = min(start + chunk_samples, len(audio_data))
-            chunk = audio_data[start:end]
-            
-            print(f"Processing chunk {i+1}/{total_chunks} ({start/sr:.2f}s - {end/sr:.2f}s)...")
-            
-            # Save chunk to temporary file
-            chunk_path = work_dir / f"chunk_{i}.wav"
-            sf.write(str(chunk_path), chunk, sr)
-            
-            # Process chunk with AudioSR
-            try:
-                waveform = audiosr.super_resolution(
-                    self.audiosr_model,
-                    str(chunk_path),
-                    seed=(seed + i) if seed is not None else (42 + i),
-                    guidance_scale=guidance_scale,
-                    ddim_steps=ddim_steps,
-                    latent_t_per_second=12.8
-                )
-                chunks_upscaled.append(waveform[0].T)  # Shape: (samples, channels)
-            finally:
-                # Clean up chunk file
-                if chunk_path.exists():
-                    chunk_path.unlink()
-            
-            print(f"Chunk {i+1} upscaled successfully")
-        
-        # Concatenate chunks with crossfade
-        print(f"Concatenating {len(chunks_upscaled)} upscaled chunks...")
-        
-        if len(chunks_upscaled) == 1:
-            final_audio = chunks_upscaled[0]
+            # Mono audio - process directly
+            is_stereo = False
+            channels_to_process = [audio_data]
+            print("Processing mono audio...")
         else:
-            # Create crossfade window
-            fade_in = np.linspace(0, 1, output_overlap_samples).reshape(-1, 1)
-            fade_out = np.linspace(1, 0, output_overlap_samples).reshape(-1, 1)
+            # Stereo or multi-channel - process each channel separately
+            is_stereo = True
+            num_channels = audio_data.shape[1]
+            channels_to_process = [audio_data[:, ch] for ch in range(num_channels)]
+            print(f"Processing {num_channels}-channel audio (each channel separately)...")
+        
+        work_dir = input_path.parent
+        upscaled_channels = []
+        
+        for ch_idx, channel_data in enumerate(channels_to_process):
+            if is_stereo:
+                print(f"\n=== Processing channel {ch_idx + 1}/{num_channels} ===")
             
-            # Start with first chunk
-            final_audio = chunks_upscaled[0]
-            
-            for i in range(1, len(chunks_upscaled)):
-                current_chunk = chunks_upscaled[i]
-                
-                # Apply crossfade
-                # Fade out the end of the previous audio
-                overlap_start = len(final_audio) - output_overlap_samples
-                final_audio[overlap_start:] *= fade_out
-                
-                # Fade in the beginning of the current chunk
-                current_chunk[:output_overlap_samples] *= fade_in
-                
-                # Combine: keep non-overlapping part + crossfaded overlap + rest of current
-                final_audio = np.concatenate([
-                    final_audio[:overlap_start],
-                    final_audio[overlap_start:] + current_chunk[:output_overlap_samples],
-                    current_chunk[output_overlap_samples:]
-                ])
+            # Process this channel
+            upscaled_channel = self._upscale_mono_channel(
+                channel_data=channel_data,
+                sr=sr,
+                work_dir=work_dir,
+                channel_idx=ch_idx,
+                duration=duration,
+                chunk_duration=CHUNK_DURATION,
+                overlap_duration=OVERLAP_DURATION,
+                output_sr=OUTPUT_SR,
+                ddim_steps=ddim_steps,
+                guidance_scale=guidance_scale,
+                seed=seed
+            )
+            upscaled_channels.append(upscaled_channel)
+        
+        # Merge channels back
+        if is_stereo:
+            # Stack channels: ensure same length
+            min_len = min(len(ch) for ch in upscaled_channels)
+            upscaled_channels = [ch[:min_len] for ch in upscaled_channels]
+            final_audio = np.column_stack(upscaled_channels)
+            print(f"\nMerged {num_channels} channels into stereo output")
+        else:
+            final_audio = upscaled_channels[0]
         
         # Save final output
         sf.write(str(output_path), final_audio, OUTPUT_SR)
@@ -370,6 +331,119 @@ class AudioSRService:
             "original_sample_rate": original_sr,
             "output_sample_rate": OUTPUT_SR
         }
+
+    def _upscale_mono_channel(
+        self,
+        channel_data: "np.ndarray",
+        sr: int,
+        work_dir: Path,
+        channel_idx: int,
+        duration: float,
+        chunk_duration: float,
+        overlap_duration: float,
+        output_sr: int,
+        ddim_steps: int,
+        guidance_scale: float,
+        seed: Optional[int]
+    ) -> "np.ndarray":
+        """Upscale a single mono channel with chunking support."""
+        import numpy as np
+        import soundfile as sf
+        
+        # If audio is short enough, process directly
+        if duration <= chunk_duration + 1.0:
+            print(f"Channel {channel_idx + 1}: Processing directly (duration <= {chunk_duration}s)...")
+            
+            # Save channel to temp file
+            temp_path = work_dir / f"channel_{channel_idx}_temp.wav"
+            sf.write(str(temp_path), channel_data, sr)
+            
+            try:
+                waveform = audiosr.super_resolution(
+                    self.audiosr_model,
+                    str(temp_path),
+                    seed=(seed + channel_idx * 1000) if seed is not None else (42 + channel_idx * 1000),
+                    guidance_scale=guidance_scale,
+                    ddim_steps=ddim_steps,
+                    latent_t_per_second=12.8
+                )
+                # AudioSR returns shape (1, channels, samples) - we want mono so take first channel
+                return waveform[0, 0, :]  # Shape: (samples,)
+            finally:
+                if temp_path.exists():
+                    temp_path.unlink()
+        
+        # For long audio, process in chunks
+        print(f"Channel {channel_idx + 1}: Processing in {chunk_duration}s chunks...")
+        
+        # Calculate chunk parameters in samples
+        chunk_samples = int(chunk_duration * sr)
+        overlap_samples = int(overlap_duration * sr)
+        step_samples = chunk_samples - overlap_samples
+        
+        # Calculate output overlap in samples (at output sample rate)
+        output_overlap_samples = int(overlap_duration * output_sr)
+        
+        # Process chunks
+        chunks_upscaled = []
+        total_chunks = (len(channel_data) - overlap_samples) // step_samples + 1
+        
+        for i, start in enumerate(range(0, len(channel_data) - overlap_samples, step_samples)):
+            end = min(start + chunk_samples, len(channel_data))
+            chunk = channel_data[start:end]
+            
+            print(f"  Chunk {i+1}/{total_chunks} ({start/sr:.2f}s - {end/sr:.2f}s)...")
+            
+            # Save chunk to temporary file
+            chunk_path = work_dir / f"channel_{channel_idx}_chunk_{i}.wav"
+            sf.write(str(chunk_path), chunk, sr)
+            
+            # Process chunk with AudioSR
+            try:
+                waveform = audiosr.super_resolution(
+                    self.audiosr_model,
+                    str(chunk_path),
+                    seed=(seed + channel_idx * 1000 + i) if seed is not None else (42 + channel_idx * 1000 + i),
+                    guidance_scale=guidance_scale,
+                    ddim_steps=ddim_steps,
+                    latent_t_per_second=12.8
+                )
+                # Take first channel of output (mono)
+                chunks_upscaled.append(waveform[0, 0, :])  # Shape: (samples,)
+            finally:
+                # Clean up chunk file
+                if chunk_path.exists():
+                    chunk_path.unlink()
+        
+        # Concatenate chunks with crossfade
+        print(f"  Concatenating {len(chunks_upscaled)} chunks for channel {channel_idx + 1}...")
+        
+        if len(chunks_upscaled) == 1:
+            return chunks_upscaled[0]
+        
+        # Create crossfade windows
+        fade_in = np.linspace(0, 1, output_overlap_samples)
+        fade_out = np.linspace(1, 0, output_overlap_samples)
+        
+        # Start with first chunk
+        final_audio = chunks_upscaled[0].copy()
+        
+        for i in range(1, len(chunks_upscaled)):
+            current_chunk = chunks_upscaled[i].copy()
+            
+            # Apply crossfade
+            overlap_start = len(final_audio) - output_overlap_samples
+            final_audio[overlap_start:] *= fade_out
+            current_chunk[:output_overlap_samples] *= fade_in
+            
+            # Combine
+            final_audio = np.concatenate([
+                final_audio[:overlap_start],
+                final_audio[overlap_start:] + current_chunk[:output_overlap_samples],
+                current_chunk[output_overlap_samples:]
+            ])
+        
+        return final_audio
 
     def _convert_to_format(
         self,
@@ -423,14 +497,18 @@ class AudioSRService:
             input_path = work_dir / f"input{input_ext}"
             self._download_audio(request.audio_url, input_path)
             
-            # Step 2: Apply low-pass filter
-            filtered_path = work_dir / "filtered.wav"
-            self._apply_lowpass_filter(
-                input_path,
-                filtered_path,
-                frequency=request.lowpass_frequency,
-                poles=request.lowpass_poles
-            )
+            # Step 2: Apply low-pass filter (optional)
+            if request.skip_lowpass:
+                print("Skipping low-pass filter (skip_lowpass=True)")
+                filtered_path = input_path
+            else:
+                filtered_path = work_dir / "filtered.wav"
+                self._apply_lowpass_filter(
+                    input_path,
+                    filtered_path,
+                    frequency=request.lowpass_frequency,
+                    poles=request.lowpass_poles
+                )
             
             # Step 3: Upscale with AudioSR
             upscaled_path = work_dir / "upscaled.wav"
@@ -493,14 +571,18 @@ class AudioSRService:
             input_path = work_dir / f"input{input_ext}"
             self._download_audio(request.audio_url, input_path)
             
-            # Step 2: Apply low-pass filter
-            filtered_path = work_dir / "filtered.wav"
-            self._apply_lowpass_filter(
-                input_path,
-                filtered_path,
-                frequency=request.lowpass_frequency,
-                poles=request.lowpass_poles
-            )
+            # Step 2: Apply low-pass filter (optional)
+            if request.skip_lowpass:
+                print("Skipping low-pass filter (skip_lowpass=True)")
+                filtered_path = input_path
+            else:
+                filtered_path = work_dir / "filtered.wav"
+                self._apply_lowpass_filter(
+                    input_path,
+                    filtered_path,
+                    frequency=request.lowpass_frequency,
+                    poles=request.lowpass_poles
+                )
             
             # Step 3: Upscale with AudioSR
             upscaled_path = work_dir / "upscaled.wav"
