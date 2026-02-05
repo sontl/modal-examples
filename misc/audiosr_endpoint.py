@@ -86,6 +86,9 @@ with audiosr_image.imports():
     from typing import Optional
     from pydantic import BaseModel, Field
     from fastapi import Response, HTTPException
+    from fastapi.responses import StreamingResponse
+    import asyncio
+    import json
     import audiosr
     import torch
     import soundfile as sf
@@ -387,14 +390,7 @@ class AudioSRService:
                     latent_t_per_second=12.8
                 )
                 # AudioSR returns shape (1, channels, samples) - we want mono so take first channel
-                upscaled = waveform[0, 0, :]  # Shape: (samples,)
-                
-                # Trim to expected output duration (AudioSR pads internally)
-                expected_output_samples = int(duration * output_sr)
-                if len(upscaled) > expected_output_samples:
-                    upscaled = upscaled[:expected_output_samples]
-                
-                return upscaled
+                return waveform[0, 0, :]  # Shape: (samples,)
             finally:
                 if temp_path.exists():
                     temp_path.unlink()
@@ -402,30 +398,23 @@ class AudioSRService:
         # For long audio, process in chunks
         print(f"Channel {channel_idx + 1}: Processing in {chunk_duration}s chunks...")
         
-        # Calculate chunk parameters in samples (input sample rate)
+        # Calculate chunk parameters in samples
         chunk_samples = int(chunk_duration * sr)
         overlap_samples = int(overlap_duration * sr)
         step_samples = chunk_samples - overlap_samples
         
-        # Calculate output parameters (output sample rate = 48kHz)
-        output_chunk_samples = int(chunk_duration * output_sr)
+        # Calculate output overlap in samples (at output sample rate)
         output_overlap_samples = int(overlap_duration * output_sr)
-        output_step_samples = output_chunk_samples - output_overlap_samples
-        
-        # Calculate expected total output length
-        expected_output_total = int(duration * output_sr)
         
         # Process chunks
         chunks_upscaled = []
-        chunk_infos = []  # Store info about each chunk for proper trimming
         total_chunks = (len(channel_data) - overlap_samples) // step_samples + 1
         
         for i, start in enumerate(range(0, len(channel_data) - overlap_samples, step_samples)):
             end = min(start + chunk_samples, len(channel_data))
             chunk = channel_data[start:end]
-            chunk_input_duration = len(chunk) / sr
             
-            print(f"  Chunk {i+1}/{total_chunks} ({start/sr:.2f}s - {end/sr:.2f}s, duration={chunk_input_duration:.2f}s)...")
+            print(f"  Chunk {i+1}/{total_chunks} ({start/sr:.2f}s - {end/sr:.2f}s)...")
             
             # Save chunk to temporary file
             chunk_path = work_dir / f"channel_{channel_idx}_chunk_{i}.wav"
@@ -442,22 +431,7 @@ class AudioSRService:
                     latent_t_per_second=12.8
                 )
                 # Take first channel of output (mono)
-                upscaled_chunk = waveform[0, 0, :]  # Shape: (samples,)
-                
-                # Calculate expected output length for this chunk
-                expected_chunk_output = int(chunk_input_duration * output_sr)
-                
-                # Trim to expected length (remove AudioSR's internal padding)
-                if len(upscaled_chunk) > expected_chunk_output:
-                    upscaled_chunk = upscaled_chunk[:expected_chunk_output]
-                
-                chunks_upscaled.append(upscaled_chunk)
-                chunk_infos.append({
-                    'input_start': start,
-                    'input_end': end,
-                    'input_duration': chunk_input_duration,
-                    'output_length': len(upscaled_chunk)
-                })
+                chunks_upscaled.append(waveform[0, 0, :])  # Shape: (samples,)
             finally:
                 # Clean up chunk file
                 if chunk_path.exists():
@@ -467,40 +441,29 @@ class AudioSRService:
         print(f"  Concatenating {len(chunks_upscaled)} chunks for channel {channel_idx + 1}...")
         
         if len(chunks_upscaled) == 1:
-            final_audio = chunks_upscaled[0]
-        else:
-            # Create crossfade windows
-            fade_in = np.linspace(0, 1, output_overlap_samples)
-            fade_out = np.linspace(1, 0, output_overlap_samples)
-            
-            # Start with first chunk
-            final_audio = chunks_upscaled[0].copy()
-            
-            for i in range(1, len(chunks_upscaled)):
-                current_chunk = chunks_upscaled[i].copy()
-                
-                # Ensure we have enough samples for crossfade
-                if len(final_audio) < output_overlap_samples or len(current_chunk) < output_overlap_samples:
-                    # Not enough for crossfade, just concatenate
-                    final_audio = np.concatenate([final_audio, current_chunk])
-                    continue
-                
-                # Apply crossfade
-                overlap_start = len(final_audio) - output_overlap_samples
-                final_audio[overlap_start:] *= fade_out
-                current_chunk[:output_overlap_samples] *= fade_in
-                
-                # Combine
-                final_audio = np.concatenate([
-                    final_audio[:overlap_start],
-                    final_audio[overlap_start:] + current_chunk[:output_overlap_samples],
-                    current_chunk[output_overlap_samples:]
-                ])
+            return chunks_upscaled[0]
         
-        # Trim final output to exact expected duration
-        if len(final_audio) > expected_output_total:
-            print(f"  Trimming output from {len(final_audio)/output_sr:.2f}s to {expected_output_total/output_sr:.2f}s")
-            final_audio = final_audio[:expected_output_total]
+        # Create crossfade windows
+        fade_in = np.linspace(0, 1, output_overlap_samples)
+        fade_out = np.linspace(1, 0, output_overlap_samples)
+        
+        # Start with first chunk
+        final_audio = chunks_upscaled[0].copy()
+        
+        for i in range(1, len(chunks_upscaled)):
+            current_chunk = chunks_upscaled[i].copy()
+            
+            # Apply crossfade
+            overlap_start = len(final_audio) - output_overlap_samples
+            final_audio[overlap_start:] *= fade_out
+            current_chunk[:output_overlap_samples] *= fade_in
+            
+            # Combine
+            final_audio = np.concatenate([
+                final_audio[:overlap_start],
+                final_audio[overlap_start:] + current_chunk[:output_overlap_samples],
+                current_chunk[output_overlap_samples:]
+            ])
         
         return final_audio
 
@@ -533,84 +496,6 @@ class AudioSRService:
         
         if result.returncode != 0:
             raise RuntimeError(f"FFmpeg conversion failed: {result.stderr}")
-
-    @modal.fastapi_endpoint(method="POST")
-    def upscale(self, request: AudioUpscaleRequest) -> Response:
-        """Upscale audio from URL using AudioSR.
-        
-        Workflow:
-        1. Download audio from URL
-        2. Apply low-pass filter to create optimal input for AudioSR
-        3. Upscale using AudioSR
-        4. Return upscaled audio as base64 or binary
-        """
-        start_time = time.perf_counter()
-        
-        # Create unique work directory for this request
-        work_dir = CONTAINER_TEMP_DIR / f"request_{int(time.time() * 1000)}"
-        work_dir.mkdir(parents=True, exist_ok=True)
-        
-        try:
-            # Step 1: Download audio
-            input_ext = Path(request.audio_url.split("?")[0]).suffix or ".mp3"
-            input_path = work_dir / f"input{input_ext}"
-            self._download_audio(request.audio_url, input_path)
-            
-            # Step 2: Apply low-pass filter (optional)
-            if request.skip_lowpass:
-                print("Skipping low-pass filter (skip_lowpass=True)")
-                filtered_path = input_path
-            else:
-                filtered_path = work_dir / "filtered.wav"
-                self._apply_lowpass_filter(
-                    input_path,
-                    filtered_path,
-                    frequency=request.lowpass_frequency,
-                    poles=request.lowpass_poles
-                )
-            
-            # Step 3: Upscale with AudioSR
-            upscaled_path = work_dir / "upscaled.wav"
-            upscale_info = self._upscale_audio(
-                filtered_path,
-                upscaled_path,
-                ddim_steps=request.ddim_steps,
-                guidance_scale=request.guidance_scale,
-                seed=request.seed
-            )
-            
-            # Step 4: Convert to requested format
-            output_ext = f".{request.output_format.value}"
-            output_path = work_dir / f"output{output_ext}"
-            self._convert_to_format(upscaled_path, output_path, request.output_format)
-            
-            # Read output file
-            with open(output_path, "rb") as f:
-                audio_bytes = f.read()
-            
-            processing_time = time.perf_counter() - start_time
-            print(f"Total processing time: {processing_time:.2f}s")
-            
-            # Return as binary response
-            return Response(
-                content=audio_bytes,
-                media_type=request.output_format.mime_type,
-                headers={
-                    "X-Original-Sample-Rate": str(upscale_info["original_sample_rate"]),
-                    "X-Output-Sample-Rate": str(upscale_info["output_sample_rate"]),
-                    "X-Processing-Time-Seconds": f"{processing_time:.2f}",
-                }
-            )
-            
-        except requests.RequestException as e:
-            raise HTTPException(status_code=400, detail=f"Failed to download audio: {str(e)}")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
-        finally:
-            # Cleanup work directory
-            import shutil
-            if work_dir.exists():
-                shutil.rmtree(work_dir, ignore_errors=True)
 
     @modal.fastapi_endpoint(method="POST")
     def upscale_json(self, request: AudioUpscaleRequest) -> AudioUpscaleResponse:
@@ -690,6 +575,284 @@ class AudioSRService:
             import shutil
             if work_dir.exists():
                 shutil.rmtree(work_dir, ignore_errors=True)
+
+    @modal.fastapi_endpoint(method="POST")
+    def upscale_stream(self, request: AudioUpscaleRequest) -> StreamingResponse:
+        """Upscale audio with streaming progress updates via Server-Sent Events (SSE).
+        
+        Progress breakdown:
+        - 0-5%: Downloading
+        - 5-10%: Filtering  
+        - 10-95%: Upscaling (divided among all chunks)
+        - 95-100%: Converting and finalizing
+        """
+        
+        def generate_events():
+            start_time = time.perf_counter()
+            work_dir = CONTAINER_TEMP_DIR / f"request_{int(time.time() * 1000)}"
+            work_dir.mkdir(parents=True, exist_ok=True)
+            
+            try:
+                # Step 1: Download audio (0-5%)
+                yield self._sse_event("progress", {
+                    "step": "downloading",
+                    "message": "Downloading audio from URL...",
+                    "percent": 0
+                })
+                
+                input_ext = Path(request.audio_url.split("?")[0]).suffix or ".mp3"
+                input_path = work_dir / f"input{input_ext}"
+                self._download_audio(request.audio_url, input_path)
+                
+                yield self._sse_event("progress", {
+                    "step": "downloaded",
+                    "message": "Audio downloaded successfully",
+                    "percent": 5
+                })
+                
+                # Step 2: Apply low-pass filter (5-10%)
+                if request.skip_lowpass:
+                    yield self._sse_event("progress", {
+                        "step": "filtering",
+                        "message": "Skipping low-pass filter",
+                        "percent": 10
+                    })
+                    filtered_path = input_path
+                else:
+                    yield self._sse_event("progress", {
+                        "step": "filtering",
+                        "message": f"Applying low-pass filter ({request.lowpass_frequency}Hz)...",
+                        "percent": 5
+                    })
+                    filtered_path = work_dir / "filtered.wav"
+                    self._apply_lowpass_filter(
+                        input_path, filtered_path,
+                        frequency=request.lowpass_frequency,
+                        poles=request.lowpass_poles
+                    )
+                    yield self._sse_event("progress", {
+                        "step": "filtered",
+                        "message": "Low-pass filter applied",
+                        "percent": 10
+                    })
+                
+                # Step 3: Upscale with streaming progress (10-95%)
+                upscaled_path = work_dir / "upscaled.wav"
+                for event in self._upscale_audio_stream(
+                    filtered_path, upscaled_path, work_dir,
+                    request.ddim_steps, request.guidance_scale, request.seed
+                ):
+                    yield self._sse_event("progress", event)
+                
+                # Step 4: Convert format (95-100%)
+                yield self._sse_event("progress", {
+                    "step": "converting",
+                    "message": f"Converting to {request.output_format.value}...",
+                    "percent": 95
+                })
+                
+                output_path = work_dir / f"output.{request.output_format.value}"
+                self._convert_to_format(upscaled_path, output_path, request.output_format)
+                
+                # Read and encode
+                with open(output_path, "rb") as f:
+                    audio_base64 = base64.b64encode(f.read()).decode("utf-8")
+                
+                processing_time = time.perf_counter() - start_time
+                
+                yield self._sse_event("complete", {
+                    "message": "Audio upscaled successfully",
+                    "audio_base64": audio_base64,
+                    "processing_time_seconds": round(processing_time, 2),
+                    "output_format": request.output_format.value,
+                    "percent": 100
+                })
+                
+            except Exception as e:
+                yield self._sse_event("error", {"message": str(e)})
+            finally:
+                import shutil
+                if work_dir.exists():
+                    shutil.rmtree(work_dir, ignore_errors=True)
+        
+        return StreamingResponse(
+            generate_events(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+        )
+    
+    def _sse_event(self, event_type: str, data: dict) -> str:
+        """Format a Server-Sent Event message."""
+        data["event"] = event_type
+        return f"data: {json.dumps(data)}\n\n"
+    
+    def _upscale_audio_stream(self, input_path, output_path, work_dir, ddim_steps, guidance_scale, seed):
+        """Upscale audio with streaming progress updates (10-95% of total progress)."""
+        import numpy as np
+        import soundfile as sf
+        
+        CHUNK_DURATION, OVERLAP_DURATION, OUTPUT_SR = 5.12, 0.5, 48000
+        UPSCALE_START_PERCENT = 10
+        UPSCALE_END_PERCENT = 95
+        UPSCALE_RANGE = UPSCALE_END_PERCENT - UPSCALE_START_PERCENT  # 85%
+        
+        info = sf.info(str(input_path))
+        duration, num_channels = info.duration, info.channels
+        
+        yield {
+            "step": "analyzing", 
+            "message": f"Audio: {duration:.1f}s, {num_channels} channel(s)",
+            "percent": UPSCALE_START_PERCENT
+        }
+        
+        audio_data, sr = sf.read(str(input_path))
+        
+        is_stereo = len(audio_data.shape) > 1
+        channels = [audio_data[:, i] for i in range(audio_data.shape[1])] if is_stereo else [audio_data]
+        
+        # Calculate total chunks for percentage
+        chunk_samples = int(CHUNK_DURATION * sr)
+        overlap_samples = int(OVERLAP_DURATION * sr)
+        step_samples = chunk_samples - overlap_samples
+        
+        total_chunks_all_channels = 0
+        for ch_data in channels:
+            if duration <= CHUNK_DURATION + 1.0:
+                total_chunks_all_channels += 1
+            else:
+                total_chunks_all_channels += (len(ch_data) - overlap_samples) // step_samples + 1
+        
+        # Percent per chunk
+        percent_per_chunk = UPSCALE_RANGE / total_chunks_all_channels
+        current_chunk_global = 0
+        
+        upscaled = []
+        for ch_idx, ch_data in enumerate(channels):
+            yield {
+                "step": "channel_start", 
+                "channel": ch_idx + 1, 
+                "total_channels": len(channels),
+                "message": f"Starting channel {ch_idx + 1}/{len(channels)}",
+                "percent": round(UPSCALE_START_PERCENT + current_chunk_global * percent_per_chunk)
+            }
+            
+            result = None
+            for evt in self._upscale_channel_stream(
+                ch_data, sr, work_dir, ch_idx, duration,
+                CHUNK_DURATION, OVERLAP_DURATION, OUTPUT_SR,
+                ddim_steps, guidance_scale, seed, len(channels),
+                current_chunk_global, total_chunks_all_channels, percent_per_chunk, UPSCALE_START_PERCENT
+            ):
+                if isinstance(evt, dict):
+                    yield evt
+                    if evt.get("step") == "chunk_complete":
+                        current_chunk_global += 1
+                else:
+                    result = evt
+            upscaled.append(result)
+        
+        if is_stereo:
+            min_len = min(len(c) for c in upscaled)
+            final = np.column_stack([c[:min_len] for c in upscaled])
+        else:
+            final = upscaled[0]
+        
+        sf.write(str(output_path), final, OUTPUT_SR)
+        yield {
+            "step": "upscale_complete", 
+            "message": f"Upscaled to {OUTPUT_SR}Hz",
+            "percent": UPSCALE_END_PERCENT
+        }
+    
+    def _upscale_channel_stream(self, ch_data, sr, work_dir, ch_idx, duration,
+                                 chunk_dur, overlap_dur, output_sr, ddim_steps, guidance_scale, seed, total_ch,
+                                 global_chunk_start, total_chunks_global, percent_per_chunk, base_percent):
+        """Upscale single channel with percentage progress."""
+        import numpy as np
+        import soundfile as sf
+        
+        chunk_samples = int(chunk_dur * sr)
+        overlap_samples = int(overlap_dur * sr)
+        step_samples = chunk_samples - overlap_samples
+        output_overlap = int(overlap_dur * output_sr)
+        
+        global_chunk = global_chunk_start
+        
+        if duration <= chunk_dur + 1.0:
+            # Single chunk
+            current_percent = round(base_percent + global_chunk * percent_per_chunk)
+            yield {
+                "step": "chunk", 
+                "chunk": 1, 
+                "total_chunks": 1, 
+                "channel": ch_idx + 1, 
+                "total_channels": total_ch,
+                "global_chunk": global_chunk + 1,
+                "total_global_chunks": total_chunks_global,
+                "message": f"Processing chunk 1/1 (channel {ch_idx + 1}/{total_ch})",
+                "percent": current_percent
+            }
+            temp = work_dir / f"ch{ch_idx}_temp.wav"
+            sf.write(str(temp), ch_data, sr)
+            try:
+                w = audiosr.super_resolution(self.audiosr_model, str(temp),
+                    seed=(seed + ch_idx * 1000) if seed else (42 + ch_idx * 1000),
+                    guidance_scale=guidance_scale, ddim_steps=ddim_steps, latent_t_per_second=12.8)
+                
+                # Signal chunk complete for counter
+                yield {"step": "chunk_complete", "percent": round(base_percent + (global_chunk + 1) * percent_per_chunk)}
+                yield w[0, 0, :]
+            finally:
+                temp.unlink() if temp.exists() else None
+            return
+        
+        total_chunks = (len(ch_data) - overlap_samples) // step_samples + 1
+        chunks = []
+        
+        for i, start in enumerate(range(0, len(ch_data) - overlap_samples, step_samples)):
+            end = min(start + chunk_samples, len(ch_data))
+            current_percent = round(base_percent + global_chunk * percent_per_chunk)
+            
+            yield {
+                "step": "chunk", 
+                "chunk": i + 1, 
+                "total_chunks": total_chunks,
+                "channel": ch_idx + 1, 
+                "total_channels": total_ch,
+                "global_chunk": global_chunk + 1,
+                "total_global_chunks": total_chunks_global,
+                "time_range": f"{start/sr:.1f}s-{end/sr:.1f}s",
+                "message": f"Processing chunk {i + 1}/{total_chunks} (channel {ch_idx + 1}/{total_ch})",
+                "percent": current_percent
+            }
+            
+            cpath = work_dir / f"ch{ch_idx}_c{i}.wav"
+            sf.write(str(cpath), ch_data[start:end], sr)
+            try:
+                w = audiosr.super_resolution(self.audiosr_model, str(cpath),
+                    seed=(seed + ch_idx * 1000 + i) if seed else (42 + ch_idx * 1000 + i),
+                    guidance_scale=guidance_scale, ddim_steps=ddim_steps, latent_t_per_second=12.8)
+                chunks.append(w[0, 0, :])
+                
+                global_chunk += 1
+                # Signal chunk complete
+                yield {"step": "chunk_complete", "percent": round(base_percent + global_chunk * percent_per_chunk)}
+            finally:
+                cpath.unlink() if cpath.exists() else None
+        
+        # Crossfade merge
+        yield {"step": "merging", "message": f"Merging {len(chunks)} chunks for channel {ch_idx + 1}"}
+        
+        fade_in, fade_out = np.linspace(0, 1, output_overlap), np.linspace(1, 0, output_overlap)
+        final = chunks[0].copy()
+        for c in chunks[1:]:
+            c = c.copy()
+            os = len(final) - output_overlap
+            final[os:] *= fade_out
+            c[:output_overlap] *= fade_in
+            final = np.concatenate([final[:os], final[os:] + c[:output_overlap], c[output_overlap:]])
+        
+        yield final
 
 
 # ## Local testing
