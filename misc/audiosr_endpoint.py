@@ -149,6 +149,14 @@ with audiosr_image.imports():
             default=OutputFormat.WAV,
             description="Output audio format"
         )
+        webhook_url: Optional[str] = Field(
+            default=None,
+            description="Optional webhook URL to POST results when processing completes"
+        )
+        request_id: Optional[str] = Field(
+            default=None,
+            description="Optional request ID for tracking (included in webhook payload)"
+        )
 
     class AudioUpscaleResponse(BaseModel):
         """Response model for audio upscaling."""
@@ -159,6 +167,12 @@ with audiosr_image.imports():
         output_sample_rate: Optional[int] = None
         processing_time_seconds: Optional[float] = None
 
+    class WebhookAcceptedResponse(BaseModel):
+        """Response returned immediately when webhook_url is provided."""
+        success: bool
+        task_id: str
+        message: str
+
 
 # ## Common configuration for AudioSR service
 
@@ -168,7 +182,7 @@ common_config = dict(
     },
     min_containers=0,
     buffer_containers=0,
-    timeout=600,  # 10 minutes timeout for long audio files
+    timeout=1800,  # 30 minutes timeout for long audio files
     enable_memory_snapshot=True,  # Snapshot model loaded on CPU for faster cold starts
 )
 
@@ -498,11 +512,168 @@ class AudioSRService:
             raise RuntimeError(f"FFmpeg conversion failed: {result.stderr}")
 
     @modal.fastapi_endpoint(method="POST")
+    def upscale_webhook(self, request: AudioUpscaleRequest):
+        """Upscale audio with webhook support.
+        
+        If webhook_url is provided, returns task_id immediately and processes
+        in the background. Progress, completion, and error events are POSTed
+        to the webhook URL.
+        
+        If webhook_url is NOT provided, falls through to synchronous JSON processing.
+        """
+        import uuid
+        
+        if request.webhook_url:
+            task_id = str(uuid.uuid4())
+            print(f"Webhook request received. task_id={task_id}, webhook_url={request.webhook_url}")
+            
+            # Spawn background processing
+            self._process_webhook_background.spawn(
+                task_id=task_id,
+                webhook_url=request.webhook_url,
+                audio_url=request.audio_url,
+                lowpass_frequency=request.lowpass_frequency,
+                lowpass_poles=request.lowpass_poles,
+                skip_lowpass=request.skip_lowpass,
+                ddim_steps=request.ddim_steps,
+                guidance_scale=request.guidance_scale,
+                seed=request.seed,
+                output_format=request.output_format.value if request.output_format else "wav",
+                request_id=request.request_id,
+            )
+            
+            return WebhookAcceptedResponse(
+                success=True,
+                task_id=task_id,
+                message="Processing started. Progress will be sent to webhook URL."
+            )
+        
+        # No webhook_url — fall through to synchronous processing
+        return self._upscale_json_sync(request)
+
+    @modal.method()
+    def _process_webhook_background(
+        self,
+        task_id: str,
+        webhook_url: str,
+        audio_url: str,
+        lowpass_frequency: int,
+        lowpass_poles: int,
+        skip_lowpass: bool,
+        ddim_steps: int,
+        guidance_scale: float,
+        seed: Optional[int],
+        output_format: str,
+        request_id: Optional[str],
+    ):
+        """Background processor that sends webhook updates."""
+        import shutil
+        
+        work_dir = CONTAINER_TEMP_DIR / f"request_{task_id}"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        
+        out_format = OutputFormat(output_format)
+        
+        def send_progress(percent: int, message: str):
+            self._send_webhook_sync(webhook_url, {
+                "event": "progress",
+                "percent": percent,
+                "message": message,
+            })
+        
+        def send_complete(audio_base64: str):
+            self._send_webhook_sync(webhook_url, {
+                "event": "complete",
+                "audio_base64": audio_base64,
+            })
+        
+        def send_error(error_msg: str):
+            self._send_webhook_sync(webhook_url, {
+                "event": "error",
+                "error": error_msg,
+            })
+        
+        try:
+            # Step 1: Download audio (0-5%)
+            send_progress(0, "Downloading audio from URL...")
+            input_ext = Path(audio_url.split("?")[0]).suffix or ".mp3"
+            input_path = work_dir / f"input{input_ext}"
+            self._download_audio(audio_url, input_path)
+            send_progress(5, "Audio downloaded successfully")
+            
+            # Step 2: Apply low-pass filter (5-10%)
+            if skip_lowpass:
+                send_progress(10, "Skipping low-pass filter")
+                filtered_path = input_path
+            else:
+                send_progress(5, f"Applying low-pass filter ({lowpass_frequency}Hz)...")
+                filtered_path = work_dir / "filtered.wav"
+                self._apply_lowpass_filter(
+                    input_path, filtered_path,
+                    frequency=lowpass_frequency,
+                    poles=lowpass_poles
+                )
+                send_progress(10, "Low-pass filter applied")
+            
+            # Step 3: Upscale with progress (10-90%)
+            upscaled_path = work_dir / "upscaled.wav"
+            for event in self._upscale_audio_stream(
+                filtered_path, upscaled_path, work_dir,
+                ddim_steps, guidance_scale, seed
+            ):
+                if isinstance(event, dict):
+                    percent = event.get("percent")
+                    message = event.get("message") or event.get("step", "Processing...")
+                    if percent is not None:
+                        send_progress(min(percent, 90), message)
+            
+            # Step 4: Convert format (90-95%)
+            send_progress(90, f"Finalizing output ({out_format.value})...")
+            output_path = work_dir / f"output.{out_format.value}"
+            
+            if out_format == OutputFormat.WAV:
+                shutil.copy(upscaled_path, output_path)
+            else:
+                self._convert_to_format(upscaled_path, output_path, out_format)
+            
+            # Step 5: Encode and send complete (95-100%)
+            send_progress(95, "Encoding output...")
+            with open(output_path, "rb") as f:
+                audio_base64 = base64.b64encode(f.read()).decode("utf-8")
+            
+            send_complete(audio_base64)
+            print(f"Webhook task {task_id} completed successfully")
+            
+        except Exception as e:
+            print(f"Webhook task {task_id} failed: {e}")
+            send_error(str(e))
+        finally:
+            if work_dir.exists():
+                shutil.rmtree(work_dir, ignore_errors=True)
+
+    def _send_webhook_sync(self, webhook_url: str, payload: dict) -> None:
+        """Send webhook payload synchronously (used in background processing)."""
+        try:
+            resp = requests.post(
+                webhook_url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=15,
+            )
+            print(f"Webhook sent: event={payload.get('event')}, status={resp.status_code}")
+        except Exception as e:
+            print(f"Webhook send failed: {e}")
+
+    @modal.fastapi_endpoint(method="POST")
     def upscale_json(self, request: AudioUpscaleRequest) -> AudioUpscaleResponse:
         """Upscale audio and return as JSON with base64-encoded audio.
         
-        Same as /upscale but returns JSON response with metadata.
+        Synchronous endpoint. For webhook-based async processing, use upscale_webhook.
         """
+        return self._upscale_json_sync(request)
+
+    def _upscale_json_sync(self, request: AudioUpscaleRequest) -> AudioUpscaleResponse:
+        """Internal synchronous JSON upscale handler."""
         start_time = time.perf_counter()
         
         # Create unique work directory for this request
@@ -541,7 +712,13 @@ class AudioSRService:
             # Step 4: Convert to requested format
             output_ext = f".{request.output_format.value}"
             output_path = work_dir / f"output{output_ext}"
-            self._convert_to_format(upscaled_path, output_path, request.output_format)
+            
+            if request.output_format == OutputFormat.WAV:
+                # Upscaled output is already WAV, so just copy/use it
+                import shutil
+                shutil.copy(upscaled_path, output_path)
+            else:
+                self._convert_to_format(upscaled_path, output_path, request.output_format)
             
             # Read and encode output file
             with open(output_path, "rb") as f:
@@ -592,9 +769,23 @@ class AudioSRService:
             work_dir = CONTAINER_TEMP_DIR / f"request_{int(time.time() * 1000)}"
             work_dir.mkdir(parents=True, exist_ok=True)
             
+            # Helper to send webhook and yield SSE
+            def emit(event_type: str, data: dict):
+                # Send webhook in background if configured
+                if request.webhook_url:
+                    webhook_payload = {
+                        "status": event_type,  # "progress", "complete", "error"
+                        "request_id": request.request_id,
+                        **data
+                    }
+                    self._send_webhook(request.webhook_url, webhook_payload)
+                
+                # Return SSE string
+                return self._sse_event(event_type, data)
+
             try:
                 # Step 1: Download audio (0-5%)
-                yield self._sse_event("progress", {
+                yield emit("progress", {
                     "step": "downloading",
                     "message": "Downloading audio from URL...",
                     "percent": 0
@@ -604,7 +795,7 @@ class AudioSRService:
                 input_path = work_dir / f"input{input_ext}"
                 self._download_audio(request.audio_url, input_path)
                 
-                yield self._sse_event("progress", {
+                yield emit("progress", {
                     "step": "downloaded",
                     "message": "Audio downloaded successfully",
                     "percent": 5
@@ -612,14 +803,14 @@ class AudioSRService:
                 
                 # Step 2: Apply low-pass filter (5-10%)
                 if request.skip_lowpass:
-                    yield self._sse_event("progress", {
+                    yield emit("progress", {
                         "step": "filtering",
                         "message": "Skipping low-pass filter",
                         "percent": 10
                     })
                     filtered_path = input_path
                 else:
-                    yield self._sse_event("progress", {
+                    yield emit("progress", {
                         "step": "filtering",
                         "message": f"Applying low-pass filter ({request.lowpass_frequency}Hz)...",
                         "percent": 5
@@ -630,7 +821,7 @@ class AudioSRService:
                         frequency=request.lowpass_frequency,
                         poles=request.lowpass_poles
                     )
-                    yield self._sse_event("progress", {
+                    yield emit("progress", {
                         "step": "filtered",
                         "message": "Low-pass filter applied",
                         "percent": 10
@@ -642,17 +833,23 @@ class AudioSRService:
                     filtered_path, upscaled_path, work_dir,
                     request.ddim_steps, request.guidance_scale, request.seed
                 ):
-                    yield self._sse_event("progress", event)
+                    yield emit("progress", event)
                 
                 # Step 4: Convert format (95-100%)
-                yield self._sse_event("progress", {
+                yield emit("progress", {
                     "step": "converting",
-                    "message": f"Converting to {request.output_format.value}...",
+                    "message": f"Finalizing output ({request.output_format.value})...",
                     "percent": 95
                 })
                 
                 output_path = work_dir / f"output.{request.output_format.value}"
-                self._convert_to_format(upscaled_path, output_path, request.output_format)
+                
+                if request.output_format == OutputFormat.WAV:
+                    # Upscaled output is already WAV, so just copy/use it
+                    import shutil
+                    shutil.copy(upscaled_path, output_path)
+                else:
+                    self._convert_to_format(upscaled_path, output_path, request.output_format)
                 
                 # Read and encode
                 with open(output_path, "rb") as f:
@@ -660,7 +857,7 @@ class AudioSRService:
                 
                 processing_time = time.perf_counter() - start_time
                 
-                yield self._sse_event("complete", {
+                yield emit("complete", {
                     "message": "Audio upscaled successfully",
                     "audio_base64": audio_base64,
                     "processing_time_seconds": round(processing_time, 2),
@@ -669,7 +866,7 @@ class AudioSRService:
                 })
                 
             except Exception as e:
-                yield self._sse_event("error", {"message": str(e)})
+                yield emit("error", {"message": str(e)})
             finally:
                 import shutil
                 if work_dir.exists():
@@ -680,6 +877,24 @@ class AudioSRService:
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
         )
+    
+    def _send_webhook(self, webhook_url: str, payload: dict) -> None:
+        """Send result to webhook URL in background thread (non-blocking)."""
+        import threading
+        
+        def _request():
+            try:
+                # print(f"Sending webhook to: {webhook_url}")
+                requests.post(
+                    webhook_url,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                    timeout=10  # Short timeout for fire-and-forget
+                )
+            except Exception as e:
+                print(f"Webhook failed: {e}")
+                
+        threading.Thread(target=_request, daemon=True).start()
     
     def _sse_event(self, event_type: str, data: dict) -> str:
         """Format a Server-Sent Event message."""
