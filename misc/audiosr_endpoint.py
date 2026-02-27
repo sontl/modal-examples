@@ -227,7 +227,44 @@ class AudioSRService:
         self.audiosr_model = self.audiosr_model.to("cuda")
         self.audiosr_model.device = torch.device("cuda")
         
+        # Monkey-patch audiosr's lowpass filters to clamp cutoff frequency
+        # below Nyquist. AudioSR can produce cutoff_freq == Nyquist (24000Hz
+        # at fs=48000) for silent/near-silent audio chunks, which causes
+        # scipy's butter/cheby1/ellip/bessel to crash with:
+        #   "Digital filter critical frequencies must be 0 < Wn < 1"
+        self._patch_audiosr_lowpass()
+        
         print("AudioSR model moved to CUDA. Ready for inference.")
+
+    @staticmethod
+    def _patch_audiosr_lowpass():
+        """Monkey-patch audiosr.lowpass filter functions to prevent Wn >= 1."""
+        import audiosr.lowpass as _lp
+
+        if getattr(_lp, '_patched', False):
+            return  # Already patched
+
+        _orig_lowpass = _lp.lowpass_filter
+        _orig_bandpass = _lp.bandpass_filter
+
+        def _safe_lowpass(x, highcut, fs, order, ftype):
+            nyq = 0.5 * fs
+            if highcut >= nyq:
+                highcut = int(nyq - 100)
+            return _orig_lowpass(x, highcut, fs, order, ftype)
+
+        def _safe_bandpass(x, lowcut, highcut, fs, order, ftype):
+            nyq = 0.5 * fs
+            if highcut >= nyq:
+                highcut = int(nyq - 100)
+            if lowcut <= 0:
+                lowcut = 1
+            return _orig_bandpass(x, lowcut, highcut, fs, order, ftype)
+
+        _lp.lowpass_filter = _safe_lowpass
+        _lp.bandpass_filter = _safe_bandpass
+        _lp._patched = True
+        print("Patched audiosr lowpass/bandpass filters (Wn clamping).")
 
     def _download_audio(self, url: str, output_path: Path) -> None:
         """Download audio file from URL."""
